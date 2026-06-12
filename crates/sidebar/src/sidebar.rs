@@ -2414,6 +2414,11 @@ impl Sidebar {
                     .min_w_0()
                     .w_full()
                     .gap_1()
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
                     .child(label)
                     .when_some(
                         self.render_remote_project_icon(ix, host.as_ref()),
