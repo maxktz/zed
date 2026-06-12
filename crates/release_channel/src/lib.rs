@@ -185,16 +185,21 @@ impl ReleaseChannel {
 
     /// Returns whether we want to poll for updates for this [`ReleaseChannel`]
     pub fn poll_for_updates(&self) -> bool {
-        !matches!(self, ReleaseChannel::Dev)
+        // Superzed is a fork with no update server of its own. Gating every
+        // update path (background polling and the manual "Check for Updates"
+        // action both funnel through here) off so it can never download and
+        // replace itself with upstream Zed. Updates are installed manually by
+        // rebuilding. Previously: `!matches!(self, ReleaseChannel::Dev)`.
+        false
     }
 
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Zed Dev",
+            ReleaseChannel::Dev => "Superzed Dev",
             ReleaseChannel::Nightly => "Zed Nightly",
             ReleaseChannel::Preview => "Zed Preview",
-            ReleaseChannel::Stable => "Zed",
+            ReleaseChannel::Stable => "Superzed",
         }
     }
 
