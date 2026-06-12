@@ -19,8 +19,8 @@ use fs::Fs;
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    ListState, Render, SharedString, Subscription, Task, TaskExt, WeakEntity, Window, list,
-    prelude::*, px,
+    ListState, Render, SharedString, Subscription, Task, TaskExt, TextStyleRefinement, WeakEntity,
+    Window, list, prelude::*, px, relative,
 };
 use itertools::Itertools as _;
 use menu::{Confirm, SelectFirst, SelectLast, SelectNext, SelectPrevious};
@@ -171,6 +171,13 @@ impl ThreadsArchiveView {
         let filter_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Search all threads…", window, cx);
+            // Single-line editors default to the code `buffer_line_height`
+            // (comfortable = 1.618), which makes the text cursor too tall for a
+            // UI input. Use a compact line height like the other search inputs.
+            editor.set_text_style_refinement(TextStyleRefinement {
+                line_height: Some(relative(1.3)),
+                ..Default::default()
+            });
             editor
         });
 
