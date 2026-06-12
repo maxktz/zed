@@ -17,7 +17,7 @@ The sidebar shows your threads grouped by project. Each project gets its own sec
 
 Terminal Threads also appear as entries in the sidebar alongside agent threads, identified by a terminal icon. Click one to switch to it.
 
-To focus the sidebar without toggling it, use {#kb multi_workspace::FocusWorkspaceSidebar}. To search your threads, press {#kb agents_sidebar::FocusSidebarFilter} while the sidebar is focused.
+To focus the sidebar without toggling it, use {#kb multi_workspace::FocusWorkspaceSidebar}. To search your threads, press {#kb agents_sidebar::FocusThreadsSearch} while the sidebar is focused.
 
 ### Switching Threads {#switching-threads}
 

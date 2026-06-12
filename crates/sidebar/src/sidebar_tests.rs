@@ -1722,7 +1722,7 @@ async fn test_agent_panel_terminals_appear_in_sidebar_and_search(cx: &mut TestAp
         let metadata = store
             .entry(terminal_id)
             .expect("terminal metadata should be persisted");
-        assert_eq!(metadata.title.as_ref(), "");
+        assert_eq!(metadata.title.as_ref(), "Terminal");
         assert_eq!(
             metadata.custom_title.as_ref().map(|title| title.as_ref()),
             Some("Dev Server")
@@ -1904,6 +1904,7 @@ async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAp
         title: "Dev Server".into(),
         custom_title: None,
         created_at: now,
+        last_activity_at: None,
         worktree_paths: WorktreePaths::from_path_lists(
             PathList::new(&[PathBuf::from("/project-a")]),
             PathList::new(&[PathBuf::from("/project-b")]),
@@ -1911,6 +1912,7 @@ async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAp
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        agent_restore_state: None,
     };
 
     cx.update(|_, cx| {
@@ -3074,6 +3076,7 @@ async fn test_thread_switcher_includes_terminal_metadata_for_open_project_group(
         title: "Feature Terminal".into(),
         custom_title: None,
         created_at,
+        last_activity_at: None,
         worktree_paths: WorktreePaths::from_path_lists(
             PathList::new(&[PathBuf::from("/project")]),
             PathList::new(&[PathBuf::from("/project-feature")]),
@@ -3081,6 +3084,7 @@ async fn test_thread_switcher_includes_terminal_metadata_for_open_project_group(
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        agent_restore_state: None,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3181,6 +3185,7 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
         title: "Feature Terminal".into(),
         custom_title: None,
         created_at,
+        last_activity_at: None,
         worktree_paths: WorktreePaths::from_path_lists(
             PathList::new(&[PathBuf::from("/project")]),
             worktree_folder_paths.clone(),
@@ -3188,6 +3193,7 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        agent_restore_state: None,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3322,6 +3328,7 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
         title: "Feature Terminal".into(),
         custom_title: None,
         created_at: chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        last_activity_at: None,
         worktree_paths: WorktreePaths::from_path_lists(
             PathList::new(&[PathBuf::from("/project")]),
             worktree_folder_paths.clone(),
@@ -3329,6 +3336,7 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        agent_restore_state: None,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3979,6 +3987,46 @@ fn type_in_search(sidebar: &Entity<Sidebar>, query: &str, cx: &mut gpui::VisualT
         });
     });
     cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn test_hidden_search_is_revealed_by_focus_filter_action(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    cx.update(|cx| {
+        agent_settings::AgentSettings::override_global(
+            agent_settings::AgentSettings {
+                show_threads_sidebar_search: false,
+                ..agent_settings::AgentSettings::get_global(cx).clone()
+            },
+            cx,
+        );
+    });
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        assert!(!sidebar.should_show_search(window, cx));
+        assert!(!sidebar.filter_editor.read(cx).is_focused(window));
+    });
+
+    cx.dispatch_action(zed_actions::agents_sidebar::FocusThreadsSearch);
+    cx.run_until_parked();
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        assert!(sidebar.should_show_search(window, cx));
+        assert!(sidebar.filter_editor.read(cx).is_focused(window));
+    });
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        window.focus(&sidebar.focus_handle, cx);
+    });
+    cx.run_until_parked();
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        assert!(!sidebar.should_show_search(window, cx));
+        assert!(!sidebar.filter_editor.read(cx).is_focused(window));
+    });
 }
 
 #[gpui::test]

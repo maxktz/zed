@@ -7826,7 +7826,7 @@ fn collaboration_page() -> SettingsPage {
 }
 
 fn ai_page() -> SettingsPage {
-    fn general_section() -> [SettingsPageItem; 3] {
+    fn general_section() -> [SettingsPageItem; 4] {
         [
             SettingsPageItem::SectionHeader("General"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -7852,6 +7852,29 @@ fn ai_page() -> SettingsPage {
                     pick: |settings_content| settings_content.agent.as_ref()?.sidebar_side.as_ref(),
                     write: |settings_content, value, _| {
                         settings_content.agent.get_or_insert_default().sidebar_side = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Threads Sidebar Search",
+                description: "Whether to show the search input in the threads sidebar by default.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.show_threads_sidebar_search"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .show_threads_sidebar_search
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .show_threads_sidebar_search = value;
                     },
                 }),
                 metadata: None,

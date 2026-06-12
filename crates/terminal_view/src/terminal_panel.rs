@@ -694,49 +694,74 @@ impl TerminalPanel {
             .detach_and_log_err(cx);
     }
 
-    fn terminals_for_task(
+    pub(crate) fn terminal_views(
         &self,
-        label: &str,
         cx: &mut App,
     ) -> Vec<(usize, Entity<Pane>, Entity<TerminalView>)> {
         let Some(workspace) = self.workspace.upgrade() else {
             return Vec::new();
         };
-
-        let pane_terminal_views = |pane: Entity<Pane>| {
-            pane.read(cx)
-                .items()
-                .enumerate()
-                .filter_map(|(index, item)| Some((index, item.act_as::<TerminalView>(cx)?)))
-                .filter_map(|(index, terminal_view)| {
-                    let task_state = terminal_view.read(cx).terminal().read(cx).task()?;
-                    if &task_state.spawned_task.full_label == label {
-                        Some((index, terminal_view))
-                    } else {
-                        None
-                    }
-                })
-                .map(move |(index, terminal_view)| (index, pane.clone(), terminal_view))
-        };
-
-        self.center
+        let workspace_panes = workspace
+            .read(cx)
             .panes()
-            .into_iter()
+            .iter()
             .cloned()
-            .flat_map(pane_terminal_views)
+            .collect::<Vec<_>>();
+
+        self.panel_terminal_views(cx)
+            .into_iter()
             .chain(
-                workspace
-                    .read(cx)
-                    .panes()
-                    .iter()
-                    .cloned()
-                    .flat_map(pane_terminal_views),
+                workspace_panes
+                    .into_iter()
+                    .flat_map(|pane| Self::terminal_views_in_pane(&pane, cx)),
             )
             .sorted_by_key(|(_, _, terminal_view)| terminal_view.entity_id())
             .collect()
     }
 
-    fn activate_terminal_view(
+    pub(crate) fn panel_terminal_views(
+        &self,
+        cx: &mut App,
+    ) -> Vec<(usize, Entity<Pane>, Entity<TerminalView>)> {
+        self.center
+            .panes()
+            .into_iter()
+            .cloned()
+            .flat_map(|pane| Self::terminal_views_in_pane(&pane, cx))
+            .collect()
+    }
+
+    fn terminal_views_in_pane(
+        pane: &Entity<Pane>,
+        cx: &mut App,
+    ) -> Vec<(usize, Entity<Pane>, Entity<TerminalView>)> {
+        pane.read(cx)
+            .items()
+            .enumerate()
+            .filter_map(|(index, item)| Some((index, item.act_as::<TerminalView>(cx)?)))
+            .map(|(index, terminal_view)| (index, pane.clone(), terminal_view))
+            .collect()
+    }
+
+    fn terminals_for_task(
+        &self,
+        label: &str,
+        cx: &mut App,
+    ) -> Vec<(usize, Entity<Pane>, Entity<TerminalView>)> {
+        self.terminal_views(cx)
+            .into_iter()
+            .filter(|(_, _, terminal_view)| {
+                terminal_view
+                    .read(cx)
+                    .terminal()
+                    .read(cx)
+                    .task()
+                    .is_some_and(|task_state| &task_state.spawned_task.full_label == label)
+            })
+            .collect()
+    }
+
+    pub(crate) fn activate_terminal_view(
         &self,
         pane: &Entity<Pane>,
         item_index: usize,

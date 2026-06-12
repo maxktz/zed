@@ -72,7 +72,7 @@ use workspace::{
 use zed_actions::OpenRecent;
 use zed_actions::editor::{MoveDown, MoveUp};
 
-use zed_actions::agents_sidebar::{FocusSidebarFilter, ToggleThreadSwitcher};
+use zed_actions::agents_sidebar::{FocusThreadsSearch, ToggleThreadSwitcher};
 
 use crate::thread_switcher::{
     ThreadSwitcher, ThreadSwitcherEntry, ThreadSwitcherEvent, ThreadSwitcherSelection,
@@ -261,6 +261,17 @@ fn split_leading_icon_char(
     ))
 }
 
+fn terminal_agent_id(display_name: &str) -> Option<AgentId> {
+    // These must match the ACP registry/server IDs used by the new-thread
+    // picker and the ACP chat rows, so terminal-agent rows resolve the exact
+    // same icon SVG. See `agent_servers::custom::{CLAUDE_AGENT_ID, CODEX_ID}`.
+    match display_name {
+        "Claude" => Some(AgentId::new("claude-acp")),
+        "Codex" => Some(AgentId::new("codex-acp")),
+        _ => None,
+    }
+}
+
 /// Picks a single glyph to render as the icon from a detected title prefix.
 ///
 /// We only ever show one glyph, so this makes a best effort to choose a
@@ -363,9 +374,12 @@ struct ThreadEntry {
 #[derive(Clone)]
 struct TerminalEntry {
     metadata: TerminalThreadMetadata,
+    icon: IconName,
+    icon_from_external_svg: Option<SharedString>,
     workspace: ThreadEntryWorkspace,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     has_notification: bool,
+    status: AgentThreadStatus,
     highlight_positions: Vec<usize>,
 }
 
@@ -757,6 +771,7 @@ pub struct Sidebar {
     /// start_renaming_thread must seed current title into the title editor
     /// so this prevents that BufferEdited event from being interpreted as user input.
     suppress_next_rename_edit: bool,
+    search_revealed: bool,
 
     /// Updated only in response to explicit user actions (clicking a
     /// thread, confirming in the thread switcher, etc.) — never from
@@ -811,6 +826,17 @@ impl Sidebar {
             editor.set_placeholder_text("Search threads…", window, cx);
             editor
         });
+        cx.on_focus_out(
+            &filter_editor.read(cx).focus_handle(cx),
+            window,
+            |this, _, _window, cx| {
+                if this.search_revealed && !this.has_filter_query(cx) {
+                    this.search_revealed = false;
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
         let thread_rename_editor = cx.new(|cx| Editor::single_line(window, cx));
 
         cx.subscribe_in(
@@ -903,6 +929,7 @@ impl Sidebar {
             renaming_thread_id: None,
             regenerating_titles: HashSet::new(),
             suppress_next_rename_edit: false,
+            search_revealed: false,
 
             thread_last_accessed: HashMap::new(),
             terminal_last_accessed: HashMap::new(),
@@ -1385,21 +1412,31 @@ impl Sidebar {
             };
             let icon_from_external_svg = agent_server_store
                 .as_ref()
-                .and_then(|store| store.read(cx).agent_icon(&agent_id));
+                .and_then(|store| store.read(cx).agent_icon(&agent_id))
+                .or_else(|| {
+                    AgentRegistryStore::try_global(cx).and_then(|store| {
+                        store
+                            .read(cx)
+                            .agent(&agent_id)
+                            .and_then(|agent| agent.icon_path().cloned())
+                    })
+                });
             (icon, icon_from_external_svg)
         };
 
         let groups = mw.project_groups(cx);
         let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
+        // Live agent activity per terminal, mapped onto the shared thread
+        // status so terminal rows render like chat rows.
+        let mut live_terminal_statuses: HashMap<TerminalId, AgentThreadStatus> = HashMap::new();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-                live_notified_terminal_ids.extend(
-                    agent_panel
-                        .read(cx)
-                        .terminals(cx)
-                        .into_iter()
-                        .filter_map(|terminal| terminal.has_notification.then_some(terminal.id)),
-                );
+                for terminal in agent_panel.read(cx).terminals(cx) {
+                    if terminal.has_notification {
+                        live_notified_terminal_ids.insert(terminal.id);
+                    }
+                    live_terminal_statuses.insert(terminal.id, terminal.status);
+                }
             }
         }
 
@@ -1459,15 +1496,30 @@ impl Sidebar {
                 linked_worktree_path_lists_for_workspaces(group_workspaces, cx);
             let make_terminal_entry =
                 |metadata: TerminalThreadMetadata, workspace: ThreadEntryWorkspace| {
+                    let (icon, icon_from_external_svg) = metadata
+                        .agent_restore_state
+                        .as_ref()
+                        .and_then(|restore_state| {
+                            terminal_agent_id(restore_state.agent.display_name())
+                        })
+                        .map(|agent_id| resolve_agent_icon(&agent_id))
+                        .unwrap_or((IconName::Terminal, None));
                     let worktrees =
                         worktree_info_from_thread_paths(&metadata.worktree_paths, &branch_by_path);
                     let has_notification =
                         live_notified_terminal_ids.contains(&metadata.terminal_id);
+                    let status = live_terminal_statuses
+                        .get(&metadata.terminal_id)
+                        .copied()
+                        .unwrap_or_default();
                     TerminalEntry {
                         metadata,
+                        icon,
+                        icon_from_external_svg,
                         workspace,
                         worktrees,
                         has_notification,
+                        status,
                         highlight_positions: Vec::new(),
                     }
                 };
@@ -3135,7 +3187,7 @@ impl Sidebar {
             if !has_selection {
                 archive.update(cx, |view, cx| view.focus_filter_editor(window, cx));
             }
-        } else if self.selection.is_none() {
+        } else if self.selection.is_none() && self.should_show_search(window, cx) {
             self.filter_editor.focus_handle(cx).focus(window, cx);
         }
     }
@@ -3148,11 +3200,13 @@ impl Sidebar {
 
         if self.filter_editor.read(cx).is_focused(window) {
             if self.reset_filter_editor_text(window, cx) {
+                self.search_revealed = false;
                 self.selection = None;
                 self.update_entries(cx);
                 return;
             }
 
+            self.search_revealed = false;
             if self.selection.is_none() {
                 self.select_first_entry();
             }
@@ -3164,21 +3218,25 @@ impl Sidebar {
         }
 
         if self.reset_filter_editor_text(window, cx) {
+            self.search_revealed = false;
             self.update_entries(cx);
         } else {
             self.selection = None;
-            self.filter_editor.focus_handle(cx).focus(window, cx);
+            if self.should_show_search(window, cx) {
+                self.filter_editor.focus_handle(cx).focus(window, cx);
+            }
             cx.notify();
         }
     }
 
     fn focus_sidebar_filter(
         &mut self,
-        _: &FocusSidebarFilter,
+        _: &FocusThreadsSearch,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.selection = None;
+        self.search_revealed = true;
         if let SidebarView::Archive(archive) = &self.view {
             archive.update(cx, |view, cx| {
                 view.clear_selection();
@@ -3204,6 +3262,13 @@ impl Sidebar {
 
     fn has_filter_query(&self, cx: &App) -> bool {
         !self.filter_editor.read(cx).text(cx).is_empty()
+    }
+
+    fn should_show_search(&self, window: &Window, cx: &App) -> bool {
+        AgentSettings::get_global(cx).show_threads_sidebar_search
+            || self.search_revealed
+            || self.has_filter_query(cx)
+            || self.filter_editor.focus_handle(cx).is_focused(window)
     }
 
     fn start_renaming_thread(
@@ -5696,7 +5761,7 @@ impl Sidebar {
                     DateTime::<Utc>::MAX_UTC
                 }
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
-                ListEntry::Terminal(terminal) => terminal.metadata.created_at,
+                ListEntry::Terminal(terminal) => terminal.metadata.display_time(),
                 ListEntry::ProjectHeader { .. } => unreachable!(),
             }
         }
@@ -5803,7 +5868,7 @@ impl Sidebar {
                 }
                 ListEntry::Terminal(terminal) => {
                     let timestamp: SharedString =
-                        format_history_entry_timestamp(terminal.metadata.created_at).into();
+                        format_history_entry_timestamp(terminal.metadata.display_time()).into();
                     Some(ThreadSwitcherEntry::Terminal(ThreadSwitcherTerminalEntry {
                         metadata: terminal.metadata.clone(),
                         workspace: terminal.workspace.clone(),
@@ -6450,7 +6515,7 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = ElementId::from(format!("terminal-{}", terminal.metadata.terminal_id));
-        let timestamp = format_history_entry_timestamp(terminal.metadata.created_at);
+        let timestamp = format_history_entry_timestamp(terminal.metadata.display_time());
         let is_hovered = self.hovered_thread_index == Some(ix);
         let color = cx.theme().colors();
         let sidebar_bg = color
@@ -6471,12 +6536,21 @@ impl Sidebar {
                 Some((icon_char, title, positions)) => (Some(icon_char), title, positions),
                 None => (None, display_title, terminal.highlight_positions.clone()),
             };
+        let icon_char = terminal
+            .icon_from_external_svg
+            .is_none()
+            .then_some(icon_char)
+            .flatten();
 
         ThreadItem::new(id, title)
             .base_bg(sidebar_bg)
-            .icon(IconName::Terminal)
+            .icon(terminal.icon)
+            .when_some(terminal.icon_from_external_svg.clone(), |this, svg| {
+                this.custom_icon_from_external_svg(svg)
+            })
             .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
             .is_remote(is_remote)
+            .status(terminal.status)
             .worktrees(worktrees)
             .timestamp(timestamp)
             .notified(terminal.has_notification)
@@ -7292,6 +7366,7 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let has_query = self.has_filter_query(cx);
+        let show_search = self.should_show_search(window, cx);
         let sidebar_on_left = self.side(cx) == SidebarSide::Left;
         let sidebar_on_right = self.side(cx) == SidebarSide::Right;
         let not_fullscreen = !window.is_fullscreen();
@@ -7322,24 +7397,27 @@ impl Sidebar {
             .when(!no_open_projects, |this| {
                 this.border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .when(traffic_lights, |this| {
+                    .when(traffic_lights && show_search, |this| {
                         this.child(Divider::vertical().color(ui::DividerColor::Border))
                     })
-                    .child(
-                        div().ml_1().child(
-                            Icon::new(IconName::MagnifyingGlass)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        ),
-                    )
-                    .child(self.render_filter_input(cx))
+                    .when(show_search, |this| {
+                        this.child(
+                            div().ml_1().child(
+                                Icon::new(IconName::MagnifyingGlass)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                        .child(self.render_filter_input(cx))
+                    })
                     .child(
                         h_flex()
                             .gap_1()
                             .when(
-                                self.selection.is_some()
+                                show_search
+                                    && self.selection.is_some()
                                     && !self.filter_editor.focus_handle(cx).is_focused(window),
-                                |this| this.child(KeyBinding::for_action(&FocusSidebarFilter, cx)),
+                                |this| this.child(KeyBinding::for_action(&FocusThreadsSearch, cx)),
                             )
                             .when(has_query, |this| {
                                 this.child(
@@ -7348,6 +7426,7 @@ impl Sidebar {
                                         .tooltip(Tooltip::text("Clear Search"))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.reset_filter_editor_text(window, cx);
+                                            this.search_revealed = false;
                                             this.update_entries(cx);
                                         })),
                                 )
@@ -7777,6 +7856,10 @@ impl WorkspaceSidebar for Sidebar {
     fn prepare_for_focus(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.selection = None;
         cx.notify();
+    }
+
+    fn focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_sidebar_filter(&FocusThreadsSearch, window, cx);
     }
 
     fn toggle_thread_switcher(

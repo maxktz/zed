@@ -1188,7 +1188,7 @@
       "l": "menu::SelectChild",
       "g g": "menu::SelectFirst",
       "shift-g": "menu::SelectLast",
-      "/": "agents_sidebar::FocusSidebarFilter",
+      "/": "agents_sidebar::FocusThreadsSearch",
       "d d": "agent::RemoveSelectedThread",
       "o": "agents_sidebar::NewThreadInGroup",
       "shift-o": "agents_sidebar::NewThreadInGroup",

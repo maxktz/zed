@@ -44,7 +44,7 @@ use workspace::{
     WorkspaceDb, WorkspaceId,
 };
 
-use zed_actions::agents_sidebar::FocusSidebarFilter;
+use zed_actions::agents_sidebar::FocusThreadsSearch;
 use zed_actions::editor::{MoveDown, MoveUp};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -893,7 +893,7 @@ impl ThreadsArchiveView {
                     .child(self.filter_editor.clone()),
             )
             .when(show_focus_keybinding, |this| {
-                this.child(KeyBinding::for_action(&FocusSidebarFilter, cx))
+                this.child(KeyBinding::for_action(&FocusThreadsSearch, cx))
             })
             .when(has_query, |this| {
                 this.child(

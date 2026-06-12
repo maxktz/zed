@@ -18,6 +18,7 @@ use util::ResultExt as _;
 use workspace::PathList;
 
 use crate::{TerminalId, thread_metadata_store::WorktreePaths};
+use terminal_view::TerminalAgentRestoreState;
 
 pub fn init(cx: &mut App) {
     TerminalThreadMetadataStore::init_global(cx);
@@ -50,9 +51,14 @@ pub struct TerminalThreadMetadata {
     pub title: SharedString,
     pub custom_title: Option<SharedString>,
     pub created_at: DateTime<Utc>,
+    /// Last time the terminal's agent did something (activity-state change),
+    /// used for the sidebar's relative timestamp and recency sorting. `None`
+    /// until an agent first acts, in which case `created_at` is used instead.
+    pub last_activity_at: Option<DateTime<Utc>>,
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub working_directory: Option<PathBuf>,
+    pub agent_restore_state: Option<TerminalAgentRestoreState>,
 }
 
 impl TerminalThreadMetadata {
@@ -62,6 +68,12 @@ impl TerminalThreadMetadata {
 
     pub fn main_worktree_paths(&self) -> &PathList {
         self.worktree_paths.main_worktree_path_list()
+    }
+
+    /// Time used for the sidebar's relative timestamp and recency sorting:
+    /// the last agent activity, or creation time if nothing has happened yet.
+    pub fn display_time(&self) -> DateTime<Utc> {
+        self.last_activity_at.unwrap_or(self.created_at)
     }
 
     pub fn display_title(&self) -> SharedString {
@@ -85,12 +97,6 @@ pub(crate) fn compose_terminal_thread_title(
     } else {
         SharedString::from(custom_title.to_string())
     }
-}
-
-pub(crate) fn terminal_title_without_prefix(title: &str) -> &str {
-    terminal_title_prefix(title)
-        .map(|prefix| &title[prefix.len()..])
-        .unwrap_or(title)
 }
 
 pub fn terminal_title_prefix(title: &str) -> Option<&str> {
@@ -445,20 +451,30 @@ struct TerminalThreadMetadataDb(ThreadSafeConnection);
 impl Domain for TerminalThreadMetadataDb {
     const NAME: &str = stringify!(TerminalThreadMetadataDb);
 
-    const MIGRATIONS: &[&str] = &[sql!(
-        CREATE TABLE IF NOT EXISTS sidebar_terminal_threads(
-            terminal_id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            custom_title TEXT,
-            created_at TEXT NOT NULL,
-            working_directory TEXT,
-            folder_paths TEXT,
-            folder_paths_order TEXT,
-            main_worktree_paths TEXT,
-            main_worktree_paths_order TEXT,
-            remote_connection TEXT
-        ) STRICT;
-    )];
+    const MIGRATIONS: &[&str] = &[
+        sql!(
+            CREATE TABLE IF NOT EXISTS sidebar_terminal_threads(
+                terminal_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                custom_title TEXT,
+                created_at TEXT NOT NULL,
+                working_directory TEXT,
+                folder_paths TEXT,
+                folder_paths_order TEXT,
+                main_worktree_paths TEXT,
+                main_worktree_paths_order TEXT,
+                remote_connection TEXT
+            ) STRICT;
+        ),
+        // The `codex_restore_state` column predates renaming this feature to
+        // cover agents beyond Codex; the column name is kept to avoid a migration.
+        sql!(
+            ALTER TABLE sidebar_terminal_threads ADD COLUMN codex_restore_state TEXT;
+        ),
+        sql!(
+            ALTER TABLE sidebar_terminal_threads ADD COLUMN last_activity_at TEXT;
+        ),
+    ];
 }
 
 db::static_connection!(TerminalThreadMetadataDb, []);
@@ -468,7 +484,7 @@ impl TerminalThreadMetadataDb {
         self.select::<TerminalThreadMetadata>(
             "SELECT terminal_id, title, custom_title, created_at, \
             working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
-            main_worktree_paths_order, remote_connection \
+            main_worktree_paths_order, remote_connection, codex_restore_state, last_activity_at \
             FROM sidebar_terminal_threads \
             ORDER BY created_at DESC",
         )?()
@@ -502,10 +518,17 @@ impl TerminalThreadMetadataDb {
             .map(serde_json::to_string)
             .transpose()
             .context("serialize terminal thread remote connection")?;
+        let agent_restore_state = row
+            .agent_restore_state
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serialize terminal agent restore state")?;
+        let last_activity_at = row.last_activity_at.map(|time| time.to_rfc3339());
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, codex_restore_state, last_activity_at) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
                            custom_title = excluded.custom_title, \
@@ -515,7 +538,9 @@ impl TerminalThreadMetadataDb {
                            folder_paths_order = excluded.folder_paths_order, \
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
-                           remote_connection = excluded.remote_connection";
+                           remote_connection = excluded.remote_connection, \
+                           codex_restore_state = excluded.codex_restore_state, \
+                           last_activity_at = excluded.last_activity_at";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&terminal_id, 1)?;
             i = stmt.bind(&title, i)?;
@@ -526,7 +551,9 @@ impl TerminalThreadMetadataDb {
             i = stmt.bind(&folder_paths_order, i)?;
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
-            stmt.bind(&remote_connection, i)?;
+            i = stmt.bind(&remote_connection, i)?;
+            i = stmt.bind(&agent_restore_state, i)?;
+            stmt.bind(&last_activity_at, i)?;
             stmt.exec()
         })
         .await
@@ -562,6 +589,9 @@ impl Column for TerminalThreadMetadata {
             Column::column(statement, next)?;
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
+        let (agent_restore_state_json, next): (Option<String>, i32) =
+            Column::column(statement, next)?;
+        let (last_activity_at_str, next): (Option<String>, i32) = Column::column(statement, next)?;
 
         let folder_paths = folder_paths_str
             .map(|paths| {
@@ -586,6 +616,11 @@ impl Column for TerminalThreadMetadata {
             .map(serde_json::from_str::<RemoteConnectionOptions>)
             .transpose()
             .context("deserialize terminal thread remote connection")?;
+        let agent_restore_state = agent_restore_state_json
+            .as_deref()
+            .map(serde_json::from_str::<TerminalAgentRestoreState>)
+            .transpose()
+            .context("deserialize terminal agent restore state")?;
 
         let worktree_paths = WorktreePaths::from_path_lists(main_worktree_paths, folder_paths)
             .unwrap_or_else(|_| WorktreePaths::default());
@@ -598,9 +633,14 @@ impl Column for TerminalThreadMetadata {
                     .filter(|title| !title.trim().is_empty())
                     .map(SharedString::from),
                 created_at: DateTime::parse_from_rfc3339(&created_at)?.with_timezone(&Utc),
+                last_activity_at: last_activity_at_str
+                    .as_deref()
+                    .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
+                    .map(|time| time.with_timezone(&Utc)),
                 worktree_paths,
                 remote_connection,
                 working_directory: working_directory.map(PathBuf::from),
+                agent_restore_state,
             },
             next,
         ))
@@ -627,9 +667,11 @@ mod tests {
             title: SharedString::from(title.to_string()),
             custom_title: None,
             created_at: now,
+            last_activity_at: None,
             worktree_paths,
             remote_connection: None,
             working_directory: None,
+            agent_restore_state: None,
         }
     }
 
@@ -657,6 +699,25 @@ mod tests {
 
         metadata.title = "Thinking".into();
         assert_eq!(metadata.display_title().as_ref(), "Fix bug");
+    }
+
+    #[test]
+    fn display_time_prefers_last_activity_over_created_at() {
+        let mut data = metadata("Dev Server", WorktreePaths::default());
+        let created = DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        data.created_at = created;
+
+        // No activity yet: falls back to creation time.
+        assert_eq!(data.display_time(), created);
+
+        // Once the agent acts, the activity time wins.
+        let active = DateTime::parse_from_rfc3339("2024-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        data.last_activity_at = Some(active);
+        assert_eq!(data.display_time(), active);
     }
 
     #[gpui::test]

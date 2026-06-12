@@ -18,7 +18,7 @@ use std::rc::Rc;
 use ui::prelude::*;
 use util::ResultExt;
 use util::path_list::PathList;
-use zed_actions::agents_sidebar::ToggleThreadSwitcher;
+use zed_actions::agents_sidebar::{FocusThreadsSearch, ToggleThreadSwitcher};
 
 use agent_settings::AgentSettings;
 use settings::SidebarDockPosition;
@@ -135,6 +135,9 @@ pub trait Sidebar: Focusable + Render + EventEmitter<SidebarEvent> + Sized {
     ) {
     }
 
+    /// Moves focus to the sidebar search/filter editor.
+    fn focus_filter(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
     /// Activates the next or previous project.
     fn cycle_project(&mut self, _forward: bool, _window: &mut Window, _cx: &mut Context<Self>) {}
 
@@ -166,6 +169,7 @@ pub trait SidebarHandle: 'static + Send + Sync {
     fn to_any(&self) -> AnyView;
     fn entity_id(&self) -> EntityId;
     fn toggle_thread_switcher(&self, select_last: bool, window: &mut Window, cx: &mut App);
+    fn focus_filter(&self, window: &mut Window, cx: &mut App);
     fn cycle_project(&self, forward: bool, window: &mut Window, cx: &mut App);
     fn cycle_thread(&self, forward: bool, window: &mut Window, cx: &mut App);
 
@@ -225,6 +229,13 @@ impl<T: Sidebar> SidebarHandle for Entity<T> {
             entity.update(cx, |this, cx| {
                 this.toggle_thread_switcher(select_last, window, cx);
             });
+        });
+    }
+
+    fn focus_filter(&self, window: &mut Window, cx: &mut App) {
+        let entity = self.clone();
+        window.defer(cx, move |window, cx| {
+            entity.update(cx, |this, cx| this.focus_filter(window, cx));
         });
     }
 
@@ -2202,6 +2213,23 @@ impl Render for MultiWorkspace {
                         |this: &mut Self, action: &ToggleThreadSwitcher, window, cx| {
                             if let Some(sidebar) = &this.sidebar {
                                 sidebar.toggle_thread_switcher(action.select_last, window, cx);
+                            }
+                        },
+                    ))
+                    .on_action(cx.listener(
+                        |this: &mut Self, _: &FocusThreadsSearch, window, cx| {
+                            if !this.multi_workspace_enabled(cx) {
+                                return;
+                            }
+
+                            if this.sidebar.is_none() {
+                                this.previous_focus_handle = window.focused(cx);
+                                this.open_sidebar(cx);
+                            }
+
+                            if let Some(sidebar) = &this.sidebar {
+                                sidebar.focus_filter(window, cx);
+                                sidebar.focus(window, cx);
                             }
                         },
                     ))

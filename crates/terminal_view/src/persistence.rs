@@ -413,6 +413,9 @@ impl Domain for TerminalDb {
         sql! (
             ALTER TABLE terminals ADD COLUMN custom_title TEXT;
         ),
+        sql! (
+            ALTER TABLE terminals ADD COLUMN codex_restore_state TEXT;
+        ),
     ];
 }
 
@@ -500,6 +503,36 @@ impl TerminalDb {
     query! {
         pub fn get_custom_title(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<String>> {
             SELECT custom_title
+            FROM terminals
+            WHERE item_id = ? AND workspace_id = ?
+        }
+    }
+
+    // The `codex_restore_state` column predates renaming this feature to cover
+    // agents beyond Codex; the column name is kept to avoid a migration.
+    pub async fn save_agent_restore_state(
+        &self,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+        agent_restore_state: Option<String>,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            let query = "INSERT INTO terminals (item_id, workspace_id, codex_restore_state)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT (workspace_id, item_id) DO UPDATE SET
+                    codex_restore_state = excluded.codex_restore_state";
+            let mut statement = Statement::prepare(conn, query)?;
+            let mut next_index = statement.bind(&item_id, 1)?;
+            next_index = statement.bind(&workspace_id, next_index)?;
+            statement.bind(&agent_restore_state, next_index)?;
+            statement.exec()
+        })
+        .await
+    }
+
+    query! {
+        pub fn get_agent_restore_state(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<String>> {
+            SELECT codex_restore_state
             FROM terminals
             WHERE item_id = ? AND workspace_id = ?
         }

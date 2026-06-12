@@ -17,6 +17,7 @@ use agent_servers::AgentServer;
 use agent_settings::UserAgentsMd;
 use collections::HashSet;
 use db::kvp::{Dismissable, KeyValueStore};
+use futures::StreamExt as _;
 use itertools::Itertools;
 use project::{AgentId, ProjectItem};
 use serde::{Deserialize, Serialize};
@@ -41,7 +42,6 @@ use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
-    terminal_title_without_prefix,
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
@@ -87,12 +87,16 @@ use settings::TerminalDockPosition;
 use settings::{NotifyWhenAgentWaiting, Settings, update_settings_file};
 
 use terminal::{Event as TerminalEvent, terminal_settings::TerminalSettings};
-use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
+use terminal_view::{
+    TerminalAgentActivity, TerminalAgentRestoreState, TerminalAgentTitle, TerminalView,
+    terminal_panel::TerminalPanel,
+};
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
 use ui::{
-    Button, ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
+    AgentThreadStatus, Button, ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding,
+    PopoverMenu, PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*,
+    utils::WithRemSize,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -116,6 +120,7 @@ const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
     "codex",
     "copilot",
     "crush",
+    "cursor-agent",
     "devin",
     "droid",
     "gemini",
@@ -187,8 +192,20 @@ pub struct AgentPanelTerminalInfo {
     pub title: SharedString,
     pub created_at: DateTime<Utc>,
     pub has_notification: bool,
+    /// Live agent activity mapped onto the same status the chat threads render.
+    pub status: AgentThreadStatus,
     pub custom_title: Option<SharedString>,
     pub working_directory: Option<PathBuf>,
+}
+
+/// Maps a terminal agent's activity onto the shared thread status so terminal
+/// rows reuse the chat rows' spinner / waiting / idle rendering.
+fn terminal_status_from_activity(activity: TerminalAgentActivity) -> AgentThreadStatus {
+    match activity {
+        TerminalAgentActivity::Running => AgentThreadStatus::Running,
+        TerminalAgentActivity::WaitingForConfirmation => AgentThreadStatus::WaitingForConfirmation,
+        TerminalAgentActivity::Idle => AgentThreadStatus::Completed,
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -972,17 +989,23 @@ pub(crate) struct AgentThread {
 
 struct AgentTerminal {
     view: Entity<TerminalView>,
-    title_editor: Option<Entity<Editor>>,
-    title_editor_initial_title: Option<String>,
-    title_editor_subscription: Option<Subscription>,
     last_known_title: String,
     last_known_terminal_title: String,
     last_observed_program: Option<String>,
     working_directory: Option<PathBuf>,
     created_at: DateTime<Utc>,
+    // Last seen agent activity and when it last changed, so the sidebar can
+    // show a relative "last active" time and sort by recency (mirrors ACP
+    // threads' `interacted_at`). Bumped only on agent activity, never on focus.
+    last_activity: TerminalAgentActivity,
+    last_activity_at: Option<DateTime<Utc>>,
     has_notification: bool,
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
+    // Watches the agent hook state file so a `WaitingForConfirmation` (or any)
+    // state lands promptly even while the agent is blocked and producing no
+    // terminal output (no `Wakeup` to drive the usual refresh).
+    _agent_state_watcher: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1007,11 +1030,22 @@ impl AgentTerminal {
     }
 
     fn terminal_title(&self, cx: &App) -> SharedString {
-        let title = self.current_terminal_title(cx);
-        if title.is_empty() && !self.last_known_terminal_title.is_empty() {
-            SharedString::from(self.last_known_terminal_title.clone())
-        } else {
-            title
+        match self.view.read(cx).agent_title() {
+            // No agent running: keep a static label rather than echoing the
+            // shell prompt, cwd, or whatever command last ran.
+            TerminalAgentTitle::Idle => SharedString::from("Terminal"),
+            // Codex (named or unnamed): use the resolved session name.
+            TerminalAgentTitle::Name(name) => SharedString::from(name),
+            // Claude writes its session name into the OSC terminal title, so
+            // track the live terminal title.
+            TerminalAgentTitle::TerminalTitle => {
+                let title = self.current_terminal_title(cx);
+                if title.is_empty() && !self.last_known_terminal_title.is_empty() {
+                    SharedString::from(self.last_known_terminal_title.clone())
+                } else {
+                    title
+                }
+            }
         }
     }
 
@@ -1022,15 +1056,6 @@ impl AgentTerminal {
             terminal_title.as_ref(),
             custom_title.as_ref().map(|title| title.as_ref()),
         )
-    }
-
-    fn editable_title(&self, cx: &App) -> SharedString {
-        if let Some(custom_title) = self.custom_title(cx) {
-            custom_title
-        } else {
-            let terminal_title = self.terminal_title(cx);
-            SharedString::from(terminal_title_without_prefix(terminal_title.as_ref()).to_string())
-        }
     }
 
     fn refresh_title(&mut self, cx: &mut App) -> bool {
@@ -1939,6 +1964,7 @@ impl AgentPanel {
             None,
             None,
             None,
+            None,
             true,
             true,
             source,
@@ -1992,6 +2018,7 @@ impl AgentPanel {
         custom_title: Option<SharedString>,
         initial_title: Option<SharedString>,
         created_at: Option<DateTime<Utc>>,
+        agent_restore_state: Option<TerminalAgentRestoreState>,
         select: bool,
         focus: bool,
         source: AgentThreadSource,
@@ -2026,7 +2053,63 @@ impl AgentPanel {
             };
             this.update_in(cx, |this, window, cx| {
                 let terminal_view = cx.new(|cx| {
-                    TerminalView::new(terminal, workspace, workspace_id, project, window, cx)
+                    TerminalView::new(
+                        terminal,
+                        workspace.clone(),
+                        workspace_id,
+                        project,
+                        window,
+                        cx,
+                    )
+                });
+                terminal_view.update(cx, |terminal_view, cx| {
+                    terminal_view.set_agent_notification_activation_handler({
+                        let workspace = workspace.clone();
+                        move |_terminal_view, window, cx| {
+                            let Some(handle) = window.window_handle().downcast::<MultiWorkspace>()
+                            else {
+                                log::error!("root view should be a MultiWorkspace");
+                                return;
+                            };
+                            let workspace = workspace.clone();
+
+                            cx.defer(move |cx| {
+                                handle
+                                    .update(cx, |multi_workspace, window, cx| {
+                                        window.activate_window();
+
+                                        let Some(workspace) = workspace.upgrade() else {
+                                            return;
+                                        };
+                                        multi_workspace.activate(
+                                            workspace.clone(),
+                                            None,
+                                            window,
+                                            cx,
+                                        );
+
+                                        workspace.update(cx, |workspace, cx| {
+                                            workspace.reveal_panel::<AgentPanel>(window, cx);
+                                            if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                                                panel.update(cx, |panel, cx| {
+                                                    panel.activate_terminal(
+                                                        terminal_id,
+                                                        true,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                            workspace.focus_panel::<AgentPanel>(window, cx);
+                                        });
+                                    })
+                                    .log_err();
+                            });
+                        }
+                    });
+                    if let Some(agent_restore_state) = agent_restore_state {
+                        terminal_view.restore_agent_session(agent_restore_state, cx);
+                    }
                 });
                 this.insert_terminal(
                     terminal_id,
@@ -2088,7 +2171,10 @@ impl AgentPanel {
                     this.refresh_terminal_metadata(terminal_id, cx);
                     this.report_terminal_program(terminal_id, source, cx);
                 }
-                TerminalEvent::Bell => this.mark_terminal_notification(terminal_id, window, cx),
+                TerminalEvent::Bell => {
+                    this.persist_terminal_metadata(terminal_id, cx);
+                    this.mark_terminal_notification(terminal_id, false, window, cx);
+                }
                 TerminalEvent::CloseTerminal => {
                     this.close_terminal_from_terminal_event(terminal_id, window, cx);
                 }
@@ -2099,22 +2185,45 @@ impl AgentPanel {
             },
         );
 
+        let agent_state_watcher = terminal_entity
+            .read(cx)
+            .agent_session_state_path()
+            .map(|path| path.to_path_buf())
+            .map(|path| {
+                let fs = self.project.read(cx).fs().clone();
+                cx.spawn(async move |this, cx| {
+                    let (mut events, _watcher) = fs.watch(&path, Duration::from_millis(100)).await;
+                    while events.next().await.is_some() {
+                        if this
+                            .update(cx, |this, cx| {
+                                this.refresh_terminal_metadata(terminal_id, cx);
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+            });
+
         let last_known_terminal_title = initial_title
             .map(|title| title.to_string())
             .unwrap_or_default();
         let mut terminal = AgentTerminal {
             view: terminal_view,
-            title_editor: None,
-            title_editor_initial_title: None,
-            title_editor_subscription: None,
             last_known_title: last_known_terminal_title.clone(),
             last_known_terminal_title,
             last_observed_program: None,
             working_directory,
             created_at: created_at.unwrap_or_else(Utc::now),
+            last_activity: TerminalAgentActivity::Idle,
+            last_activity_at: TerminalThreadMetadataStore::try_global(cx)
+                .and_then(|store| store.read(cx).entry(terminal_id))
+                .and_then(|metadata| metadata.last_activity_at),
             has_notification: false,
             notification_windows: Vec::new(),
             notification_subscriptions: Vec::new(),
+            _agent_state_watcher: agent_state_watcher,
             _subscriptions: vec![view_subscription, terminal_subscription],
         };
         if self.pending_terminal_spawn == Some(terminal_id) {
@@ -2236,9 +2345,25 @@ impl AgentPanel {
     }
 
     fn refresh_terminal_metadata(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
-        if let Some(terminal) = self.terminals.get_mut(&terminal_id)
-            && terminal.refresh_metadata(cx)
-        {
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        let metadata_changed = terminal.refresh_metadata(cx);
+        // Recompute the agent state/activity (e.g. Codex, which has no
+        // session-end hook) so the stale resume state gets cleared and the
+        // sidebar status updates even when the terminal title is unchanged.
+        let agent_state_changed = terminal.view.update(cx, |terminal_view, cx| {
+            terminal_view.refresh_agent_restore_state(cx)
+        });
+        // Bump the "last active" time whenever the agent's activity changes
+        // (started, asked for confirmation, finished) so the row sorts by
+        // recency like chat threads. Deliberately ignores focus.
+        let activity = terminal.view.read(cx).agent_activity();
+        if activity != terminal.last_activity {
+            terminal.last_activity = activity;
+            terminal.last_activity_at = Some(Utc::now());
+        }
+        if metadata_changed || agent_state_changed {
             self.persist_terminal_metadata(terminal_id, cx);
             cx.emit(AgentPanelEvent::EntryChanged);
             cx.notify();
@@ -2256,14 +2381,19 @@ impl AgentPanel {
         }
     }
 
-    fn persist_all_terminal_metadata(&self, cx: &mut Context<Self>) {
+    fn persist_all_terminal_metadata(&mut self, cx: &mut Context<Self>) {
         let terminal_ids = self.terminals.keys().copied().collect::<Vec<_>>();
         for terminal_id in terminal_ids {
             self.persist_terminal_metadata(terminal_id, cx);
         }
     }
 
-    fn persist_terminal_metadata(&self, terminal_id: TerminalId, cx: &mut Context<Self>) {
+    fn persist_terminal_metadata(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
+        if let Some(terminal) = self.terminals.get(&terminal_id) {
+            terminal.view.update(cx, |terminal_view, cx| {
+                terminal_view.refresh_agent_restore_state(cx);
+            });
+        }
         let Some(store) = TerminalThreadMetadataStore::try_global(cx) else {
             return;
         };
@@ -2287,9 +2417,11 @@ impl AgentPanel {
             title: terminal.terminal_title(cx),
             custom_title: terminal.custom_title(cx),
             created_at: terminal.created_at,
+            last_activity_at: terminal.last_activity_at,
             worktree_paths: project.worktree_paths(cx),
             remote_connection: project.remote_connection_options(cx),
             working_directory: terminal.working_directory.clone(),
+            agent_restore_state: terminal.view.read(cx).agent_restore_state(),
         })
     }
 
@@ -2320,6 +2452,7 @@ impl AgentPanel {
             metadata.custom_title.clone(),
             initial_title,
             Some(metadata.created_at),
+            metadata.agent_restore_state,
             true,
             focus,
             source,
@@ -2366,141 +2499,10 @@ impl AgentPanel {
         (!metadata.title.is_empty()).then(|| metadata.title.clone())
     }
 
-    fn edit_terminal_title(
-        &mut self,
-        terminal_id: TerminalId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
-            return;
-        };
-
-        if let Some(title_editor) = terminal.title_editor.as_ref() {
-            title_editor.focus_handle(cx).focus(window, cx);
-            return;
-        }
-
-        let title = terminal.editable_title(cx).to_string();
-        let title_editor_initial_title = title.clone();
-        let title_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_text(title, window, cx);
-            editor
-        });
-        let title_editor_subscription = cx.subscribe_in(
-            &title_editor,
-            window,
-            move |this, title_editor, event: &editor::EditorEvent, window, cx| {
-                this.handle_terminal_title_editor_event(
-                    terminal_id,
-                    title_editor,
-                    event,
-                    window,
-                    cx,
-                );
-            },
-        );
-        title_editor.update(cx, |editor, cx| {
-            editor.select_all(&editor::actions::SelectAll, window, cx);
-            editor.focus_handle(cx).focus(window, cx);
-        });
-        terminal.title_editor = Some(title_editor);
-        terminal.title_editor_initial_title = Some(title_editor_initial_title);
-        terminal.title_editor_subscription = Some(title_editor_subscription);
-        cx.notify();
-    }
-
-    fn stop_editing_terminal_title(
-        &mut self,
-        terminal_id: TerminalId,
-        focus_terminal: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
-            return;
-        };
-        let terminal_view = terminal.view.clone();
-        terminal.title_editor = None;
-        terminal.title_editor_initial_title = None;
-        terminal.title_editor_subscription = None;
-        let title_changed = terminal.refresh_title(cx);
-
-        if focus_terminal {
-            terminal_view.focus_handle(cx).focus(window, cx);
-        }
-        if title_changed {
-            cx.emit(AgentPanelEvent::EntryChanged);
-        }
-        cx.notify();
-    }
-
-    fn handle_terminal_title_editor_event(
-        &mut self,
-        terminal_id: TerminalId,
-        title_editor: &Entity<Editor>,
-        event: &editor::EditorEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match event {
-            editor::EditorEvent::BufferEdited => {
-                if !title_editor.read(cx).is_focused(window) {
-                    return;
-                }
-                let Some((terminal_view, initial_title, terminal_title)) =
-                    self.terminals.get(&terminal_id).and_then(|terminal| {
-                        terminal
-                            .title_editor
-                            .as_ref()
-                            .is_some_and(|current_editor| current_editor == title_editor)
-                            .then(|| {
-                                (
-                                    terminal.view.clone(),
-                                    terminal.title_editor_initial_title.clone(),
-                                    terminal.terminal_title(cx),
-                                )
-                            })
-                    })
-                else {
-                    return;
-                };
-                let new_title = title_editor.read(cx).text(cx);
-                if initial_title.as_deref() == Some(new_title.as_str()) {
-                    return;
-                }
-                let label = if new_title.trim().is_empty()
-                    || new_title == terminal_title_without_prefix(terminal_title.as_ref())
-                {
-                    None
-                } else {
-                    Some(new_title)
-                };
-
-                cx.defer(move |cx| {
-                    terminal_view.update(cx, |terminal_view, cx| {
-                        terminal_view.set_custom_title(label, cx);
-                    });
-                });
-            }
-            editor::EditorEvent::Blurred => {
-                if self
-                    .terminals
-                    .get(&terminal_id)
-                    .and_then(|terminal| terminal.title_editor.as_ref())
-                    .is_some_and(|current_editor| current_editor == title_editor)
-                {
-                    self.stop_editing_terminal_title(terminal_id, false, window, cx);
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn mark_terminal_notification(
         &mut self,
         terminal_id: TerminalId,
+        show_popup: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2526,7 +2528,9 @@ impl AgentPanel {
                 self.terminal_status_visible(terminal_id, window, cx),
                 cx,
             );
-            self.show_terminal_notification(terminal_id, window, cx);
+            if show_popup {
+                self.show_terminal_notification(terminal_id, window, cx);
+            }
         }
     }
 
@@ -3241,6 +3245,7 @@ impl AgentPanel {
                 title: terminal.title(cx),
                 created_at: terminal.created_at,
                 has_notification: terminal.has_notification,
+                status: terminal_status_from_activity(terminal.view.read(cx).agent_activity()),
                 custom_title: terminal.custom_title(cx),
                 working_directory: terminal.working_directory.clone(),
             })
@@ -5130,6 +5135,7 @@ impl AgentPanel {
             None,
             None,
             None,
+            None,
             true,
             false,
             source,
@@ -5311,20 +5317,13 @@ impl AgentPanel {
                 .read(cx)
                 .root_thread_view()
                 .is_some_and(|view| view.read(cx).title_editor.read(cx).is_focused(window)),
-            VisibleSurface::Terminal(_) => self
-                .active_terminal_id()
-                .and_then(|id| self.terminals.get(&id))
-                .and_then(|terminal| terminal.title_editor.as_ref())
-                .is_some_and(|editor| editor.read(cx).is_focused(window)),
             _ => false,
         }
     }
 
     fn should_show_title_edit(&self, window: &Window, cx: &Context<Self>) -> bool {
-        matches!(
-            self.visible_surface(),
-            VisibleSurface::AgentThread(_) | VisibleSurface::Terminal(_)
-        ) && self.has_open_project(cx)
+        matches!(self.visible_surface(), VisibleSurface::AgentThread(_))
+            && self.has_open_project(cx)
             && !self.is_title_editor_focused(window, cx)
     }
 
@@ -5412,45 +5411,20 @@ impl AgentPanel {
                 }
             }
             VisibleSurface::Terminal(_) => {
-                if let Some((terminal_id, title_editor, title)) =
-                    self.active_terminal_id().and_then(|terminal_id| {
-                        self.terminals.get(&terminal_id).map(|terminal| {
-                            (
-                                terminal_id,
-                                terminal.title_editor.clone(),
-                                terminal.title(cx),
-                            )
-                        })
-                    })
-                {
-                    if let Some(title_editor) = title_editor {
-                        div()
-                            .flex_1()
-                            .on_action(cx.listener(move |this, _: &menu::Confirm, window, cx| {
-                                this.stop_editing_terminal_title(terminal_id, true, window, cx);
-                            }))
-                            .on_action(cx.listener(
-                                move |this, _: &editor::actions::Cancel, window, cx| {
-                                    this.stop_editing_terminal_title(terminal_id, true, window, cx);
-                                },
-                            ))
-                            .child(title_editor)
-                            .into_any_element()
-                    } else {
-                        div()
-                            .id("terminal-title")
-                            .flex_1()
-                            .cursor_text()
-                            .overflow_x_scroll()
-                            .child(Label::new(title).color(Color::Muted).single_line())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.edit_terminal_title(terminal_id, window, cx);
-                            }))
-                            .into_any_element()
-                    }
-                } else {
-                    Label::new("Terminal").into_any_element()
-                }
+                // Terminal-thread titles are owned by the running agent (or a
+                // static "Terminal" label when idle), so they aren't renamed
+                // from the Zed UI.
+                let title = self
+                    .active_terminal_id()
+                    .and_then(|terminal_id| self.terminals.get(&terminal_id))
+                    .map(|terminal| terminal.title(cx))
+                    .unwrap_or_else(|| SharedString::from("Terminal"));
+                div()
+                    .id("terminal-title")
+                    .flex_1()
+                    .overflow_x_scroll()
+                    .child(Label::new(title).color(Color::Muted).single_line())
+                    .into_any_element()
             }
             VisibleSurface::Configuration(_) => {
                 Label::new("Settings").truncate().into_any_element()
@@ -7350,9 +7324,11 @@ mod tests {
             title: "Dev Server".into(),
             custom_title: None,
             created_at: Utc::now(),
+            last_activity_at: None,
             worktree_paths: project.read_with(cx, |project, cx| project.worktree_paths(cx)),
             remote_connection: None,
             working_directory: None,
+            agent_restore_state: None,
         };
         assert_eq!(metadata.working_directory, None);
 
@@ -7441,11 +7417,13 @@ mod tests {
             title: "Restored Terminal".into(),
             custom_title: None,
             created_at: Utc::now(),
+            last_activity_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
                 "/project",
             )])),
             remote_connection: None,
             working_directory: None,
+            agent_restore_state: None,
         };
         panel
             .update_in(&mut cx, |panel, window, cx| {
@@ -9381,7 +9359,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_terminal_title_omits_placeholder_title(cx: &mut TestAppContext) {
+    async fn test_idle_terminal_title_is_static(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         let terminal_id = panel
             .update_in(&mut cx, |panel, window, cx| {
@@ -9390,15 +9368,17 @@ mod tests {
             .expect("test terminal should be inserted");
         cx.run_until_parked();
 
+        // With no agent running, the title is a static label rather than the
+        // shell's own title or breadcrumb.
         panel.read_with(&cx, |panel, cx| {
             let terminals = panel.terminals(cx);
             assert_eq!(terminals.len(), 1);
-            assert_eq!(terminals[0].title.as_ref(), "");
+            assert_eq!(terminals[0].title.as_ref(), "Terminal");
             let terminal = panel
                 .terminals
                 .get(&terminal_id)
                 .expect("terminal should remain in the panel");
-            assert_eq!(terminal.title(cx).as_ref(), "");
+            assert_eq!(terminal.title(cx).as_ref(), "Terminal");
         });
 
         let terminal_view = panel.read_with(&cx, |panel, _cx| {
@@ -9411,42 +9391,27 @@ mod tests {
         });
         let terminal_entity =
             terminal_view.read_with(&cx, |terminal_view, _cx| terminal_view.terminal().clone());
-        terminal_entity.update(&mut cx, |_terminal, cx| {
-            cx.emit(TerminalEvent::TitleChanged);
-        });
-        cx.run_until_parked();
-
-        panel.read_with(&cx, |panel, cx| {
-            let terminals = panel.terminals(cx);
-            assert_eq!(terminals.len(), 1);
-            assert_eq!(terminals[0].title.as_ref(), "");
-            let terminal = panel
-                .terminals
-                .get(&terminal_id)
-                .expect("terminal should remain in the panel");
-            assert_eq!(terminal.title(cx).as_ref(), "");
-        });
-
         terminal_entity.update(&mut cx, |terminal, cx| {
             terminal.breadcrumb_text = "Shell Breadcrumb".to_string();
             cx.emit(TerminalEvent::BreadcrumbsChanged);
         });
         cx.run_until_parked();
 
+        // The shell breadcrumb does not leak into an idle terminal's title.
         panel.read_with(&cx, |panel, cx| {
             let terminals = panel.terminals(cx);
             assert_eq!(terminals.len(), 1);
-            assert_eq!(terminals[0].title.as_ref(), "Shell Breadcrumb");
+            assert_eq!(terminals[0].title.as_ref(), "Terminal");
             let terminal = panel
                 .terminals
                 .get(&terminal_id)
                 .expect("terminal should remain in the panel");
-            assert_eq!(terminal.title(cx).as_ref(), "Shell Breadcrumb");
+            assert_eq!(terminal.title(cx).as_ref(), "Terminal");
         });
     }
 
     #[gpui::test]
-    async fn test_title_edit_affordance_matches_threads_and_terminals(cx: &mut TestAppContext) {
+    async fn test_title_edit_affordance_shown_for_threads_not_terminals(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -9462,7 +9427,7 @@ mod tests {
             assert!(panel.should_show_title_edit(window, cx));
         });
 
-        let terminal_id = panel
+        panel
             .update_in(&mut cx, |panel, window, cx| {
                 panel.insert_test_terminal("Dev Server", true, window, cx)
             })
@@ -9474,17 +9439,14 @@ mod tests {
                 panel.visible_surface(),
                 VisibleSurface::Terminal(_)
             ));
-            assert!(panel.should_show_title_edit(window, cx));
-
-            panel.edit_terminal_title(terminal_id, window, cx);
+            // Terminal-thread titles are owned by the agent, so the rename
+            // affordance is not offered for them.
             assert!(!panel.should_show_title_edit(window, cx));
         });
     }
 
     #[gpui::test]
-    async fn test_restored_terminal_uses_metadata_title_until_shell_title_arrives(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_restored_idle_terminal_uses_static_title(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         let terminal_id = TerminalId::new();
         let now = Utc::now();
@@ -9493,11 +9455,13 @@ mod tests {
             title: "Persisted Shell Title".into(),
             custom_title: None,
             created_at: now,
+            last_activity_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
                 "/project",
             )])),
             remote_connection: None,
             working_directory: None,
+            agent_restore_state: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -9507,10 +9471,12 @@ mod tests {
         });
         cx.run_until_parked();
 
+        // No agent is running, so the restored terminal uses the static label
+        // rather than its persisted shell title.
         let terminal_view = panel.read_with(&cx, |panel, cx| {
             let terminals = panel.terminals(cx);
             assert_eq!(terminals.len(), 1);
-            assert_eq!(terminals[0].title.as_ref(), "Persisted Shell Title");
+            assert_eq!(terminals[0].title.as_ref(), "Terminal");
             panel
                 .terminals
                 .get(&terminal_id)
@@ -9530,7 +9496,7 @@ mod tests {
         panel.read_with(&cx, |panel, cx| {
             let terminals = panel.terminals(cx);
             assert_eq!(terminals.len(), 1);
-            assert_eq!(terminals[0].title.as_ref(), "Fresh Shell Title");
+            assert_eq!(terminals[0].title.as_ref(), "Terminal");
         });
     }
 
@@ -9544,11 +9510,13 @@ mod tests {
             title: "Persisted Shell Title".into(),
             custom_title: None,
             created_at: now,
+            last_activity_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
                 "/project",
             )])),
             remote_connection: None,
             working_directory: None,
+            agent_restore_state: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -9600,331 +9568,6 @@ mod tests {
         panel.read_with(&cx, |panel, cx| {
             assert_eq!(panel.last_created_entry_kind, AgentPanelEntryKind::Terminal);
             assert!(panel.should_create_terminal_for_new_entry(cx));
-        });
-    }
-
-    #[gpui::test]
-    async fn test_terminal_title_editor_is_created_only_while_editing(cx: &mut TestAppContext) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        let terminal_id = panel
-            .update_in(&mut cx, |panel, window, cx| {
-                panel.insert_test_terminal("Dev Server", true, window, cx)
-            })
-            .expect("test terminal should be inserted");
-        cx.run_until_parked();
-
-        panel.read_with(&cx, |panel, _cx| {
-            let terminal = panel
-                .terminals
-                .get(&terminal_id)
-                .expect("terminal should remain in the panel");
-            assert!(terminal.title_editor.is_none());
-        });
-
-        panel.update(&mut cx, |panel, cx| {
-            panel.refresh_terminal_metadata(terminal_id, cx);
-        });
-        cx.run_until_parked();
-
-        panel.read_with(&cx, |panel, _cx| {
-            let terminal = panel
-                .terminals
-                .get(&terminal_id)
-                .expect("terminal should remain in the panel");
-            assert!(terminal.title_editor.is_none());
-        });
-
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.edit_terminal_title(terminal_id, window, cx);
-        });
-        cx.run_until_parked();
-
-        panel.read_with(&cx, |panel, cx| {
-            let terminal = panel
-                .terminals
-                .get(&terminal_id)
-                .expect("terminal should remain in the panel");
-            let title_editor = terminal
-                .title_editor
-                .as_ref()
-                .expect("terminal title editor should be active while editing");
-            assert_eq!(title_editor.read(cx).text(cx), "Dev Server");
-        });
-
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.stop_editing_terminal_title(terminal_id, false, window, cx);
-        });
-        cx.run_until_parked();
-
-        panel.read_with(&cx, |panel, _cx| {
-            let terminal = panel
-                .terminals
-                .get(&terminal_id)
-                .expect("terminal should remain in the panel");
-            assert!(terminal.title_editor.is_none());
-        });
-    }
-
-    #[gpui::test]
-    async fn test_terminal_title_editor_does_not_set_custom_title_when_unchanged(
-        cx: &mut TestAppContext,
-    ) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        let terminal_id = panel
-            .update_in(&mut cx, |panel, window, cx| {
-                panel.insert_test_terminal("Initial Custom Title", true, window, cx)
-            })
-            .expect("test terminal should be inserted");
-        cx.run_until_parked();
-
-        let terminal_view = panel.read_with(&cx, |panel, _cx| {
-            panel
-                .terminals
-                .get(&terminal_id)
-                .expect("terminal should remain in the panel")
-                .view
-                .clone()
-        });
-        terminal_view.update(&mut cx, |terminal_view, cx| {
-            terminal_view.set_custom_title(None, cx);
-        });
-        let terminal_entity =
-            terminal_view.read_with(&cx, |terminal_view, _cx| terminal_view.terminal().clone());
-        terminal_entity.update(&mut cx, |terminal, cx| {
-            terminal.breadcrumb_text = "Shell Breadcrumb".to_string();
-            cx.emit(TerminalEvent::BreadcrumbsChanged);
-        });
-        cx.run_until_parked();
-
-        panel.read_with(&cx, |panel, cx| {
-            let terminals = panel.terminals(cx);
-            assert_eq!(terminals.len(), 1);
-            assert_eq!(terminals[0].title.as_ref(), "Shell Breadcrumb");
-        });
-
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.edit_terminal_title(terminal_id, window, cx);
-        });
-        cx.run_until_parked();
-
-        let title_editor = panel.read_with(&cx, |panel, cx| {
-            let terminal = panel
-                .terminals
-                .get(&terminal_id)
-                .expect("terminal should remain in the panel");
-            let title_editor = terminal
-                .title_editor
-                .as_ref()
-                .expect("terminal title editor should be active while editing")
-                .clone();
-            assert_eq!(title_editor.read(cx).text(cx), "Shell Breadcrumb");
-            title_editor
-        });
-
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.handle_terminal_title_editor_event(
-                terminal_id,
-                &title_editor,
-                &editor::EditorEvent::BufferEdited,
-                window,
-                cx,
-            );
-        });
-        cx.run_until_parked();
-
-        terminal_view.read_with(&cx, |terminal_view, _cx| {
-            assert!(terminal_view.custom_title().is_none());
-        });
-
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.stop_editing_terminal_title(terminal_id, false, window, cx);
-        });
-        terminal_entity.update(&mut cx, |terminal, cx| {
-            terminal.breadcrumb_text = "Updated Shell Breadcrumb".to_string();
-            cx.emit(TerminalEvent::BreadcrumbsChanged);
-        });
-        cx.run_until_parked();
-
-        panel.read_with(&cx, |panel, cx| {
-            let terminals = panel.terminals(cx);
-            assert_eq!(terminals.len(), 1);
-            assert_eq!(terminals[0].title.as_ref(), "Updated Shell Breadcrumb");
-        });
-    }
-
-    #[gpui::test]
-    async fn test_terminal_custom_title_recomposes_with_live_spinner(cx: &mut TestAppContext) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        let terminal_id = panel
-            .update_in(&mut cx, |panel, window, cx| {
-                panel.insert_test_terminal("Fix bug", true, window, cx)
-            })
-            .expect("test terminal should be inserted");
-        cx.run_until_parked();
-
-        let terminal_entity = panel.read_with(&cx, |panel, _cx| {
-            panel
-                .terminals
-                .get(&terminal_id)
-                .expect("terminal should remain in the panel")
-                .view
-                .clone()
-        });
-        let terminal_entity =
-            terminal_entity.read_with(&cx, |terminal_view, _cx| terminal_view.terminal().clone());
-
-        terminal_entity.update(&mut cx, |terminal, cx| {
-            terminal.breadcrumb_text = "⠋ Thinking".to_string();
-            cx.emit(TerminalEvent::BreadcrumbsChanged);
-        });
-        cx.run_until_parked();
-
-        panel.read_with(&cx, |panel, cx| {
-            let terminals = panel.terminals(cx);
-            assert_eq!(terminals.len(), 1);
-            assert_eq!(terminals[0].title.as_ref(), "⠋ Fix bug");
-            let metadata = panel
-                .terminal_metadata(terminal_id, cx)
-                .expect("terminal metadata should be available");
-            assert_eq!(metadata.title.as_ref(), "⠋ Thinking");
-            assert_eq!(
-                metadata.custom_title.as_ref().map(|title| title.as_ref()),
-                Some("Fix bug")
-            );
-            assert_eq!(metadata.display_title().as_ref(), "⠋ Fix bug");
-        });
-
-        terminal_entity.update(&mut cx, |terminal, cx| {
-            terminal.breadcrumb_text = "⠙ Thinking".to_string();
-            cx.emit(TerminalEvent::BreadcrumbsChanged);
-        });
-        cx.run_until_parked();
-
-        panel.read_with(&cx, |panel, cx| {
-            let terminals = panel.terminals(cx);
-            assert_eq!(terminals.len(), 1);
-            assert_eq!(terminals[0].title.as_ref(), "⠙ Fix bug");
-            let metadata = panel
-                .terminal_metadata(terminal_id, cx)
-                .expect("terminal metadata should be available");
-            assert_eq!(metadata.title.as_ref(), "⠙ Thinking");
-            assert_eq!(metadata.display_title().as_ref(), "⠙ Fix bug");
-        });
-
-        terminal_entity.update(&mut cx, |terminal, cx| {
-            terminal.breadcrumb_text = "Thinking".to_string();
-            cx.emit(TerminalEvent::BreadcrumbsChanged);
-        });
-        cx.run_until_parked();
-
-        panel.read_with(&cx, |panel, cx| {
-            let terminals = panel.terminals(cx);
-            assert_eq!(terminals.len(), 1);
-            assert_eq!(terminals[0].title.as_ref(), "Fix bug");
-            let metadata = panel
-                .terminal_metadata(terminal_id, cx)
-                .expect("terminal metadata should be available");
-            assert_eq!(metadata.title.as_ref(), "Thinking");
-            assert_eq!(metadata.display_title().as_ref(), "Fix bug");
-        });
-    }
-
-    #[gpui::test]
-    async fn test_terminal_title_editor_excludes_spinner_prefix(cx: &mut TestAppContext) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        let terminal_id = panel
-            .update_in(&mut cx, |panel, window, cx| {
-                panel.insert_test_terminal("Initial Custom Title", true, window, cx)
-            })
-            .expect("test terminal should be inserted");
-        cx.run_until_parked();
-
-        let terminal_view = panel.read_with(&cx, |panel, _cx| {
-            panel
-                .terminals
-                .get(&terminal_id)
-                .expect("terminal should remain in the panel")
-                .view
-                .clone()
-        });
-        terminal_view.update(&mut cx, |terminal_view, cx| {
-            terminal_view.set_custom_title(None, cx);
-        });
-        let terminal_entity =
-            terminal_view.read_with(&cx, |terminal_view, _cx| terminal_view.terminal().clone());
-        terminal_entity.update(&mut cx, |terminal, cx| {
-            terminal.breadcrumb_text = "⠋ Thinking".to_string();
-            cx.emit(TerminalEvent::BreadcrumbsChanged);
-        });
-        cx.run_until_parked();
-
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.edit_terminal_title(terminal_id, window, cx);
-        });
-        cx.run_until_parked();
-
-        let title_editor = panel.read_with(&cx, |panel, cx| {
-            let terminal = panel
-                .terminals
-                .get(&terminal_id)
-                .expect("terminal should remain in the panel");
-            let title_editor = terminal
-                .title_editor
-                .as_ref()
-                .expect("terminal title editor should be active while editing")
-                .clone();
-            assert_eq!(title_editor.read(cx).text(cx), "Thinking");
-            title_editor
-        });
-
-        title_editor.update_in(&mut cx, |editor, window, cx| {
-            editor.set_text("Fix bug", window, cx);
-            editor.focus_handle(cx).focus(window, cx);
-        });
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.handle_terminal_title_editor_event(
-                terminal_id,
-                &title_editor,
-                &editor::EditorEvent::BufferEdited,
-                window,
-                cx,
-            );
-        });
-        cx.run_until_parked();
-
-        terminal_view.read_with(&cx, |terminal_view, _cx| {
-            assert_eq!(terminal_view.custom_title(), Some("Fix bug"));
-        });
-        panel.read_with(&cx, |panel, cx| {
-            let terminals = panel.terminals(cx);
-            assert_eq!(terminals.len(), 1);
-            assert_eq!(terminals[0].title.as_ref(), "⠋ Fix bug");
-            let metadata = panel
-                .terminal_metadata(terminal_id, cx)
-                .expect("terminal metadata should be available");
-            assert_eq!(metadata.title.as_ref(), "⠋ Thinking");
-            assert_eq!(
-                metadata.custom_title.as_ref().map(|title| title.as_ref()),
-                Some("Fix bug")
-            );
-        });
-
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.stop_editing_terminal_title(terminal_id, false, window, cx);
-            panel.edit_terminal_title(terminal_id, window, cx);
-        });
-        cx.run_until_parked();
-
-        panel.read_with(&cx, |panel, cx| {
-            let terminal = panel
-                .terminals
-                .get(&terminal_id)
-                .expect("terminal should remain in the panel");
-            let title_editor = terminal
-                .title_editor
-                .as_ref()
-                .expect("terminal title editor should be active while editing");
-            assert_eq!(title_editor.read(cx).text(cx), "Fix bug");
         });
     }
 

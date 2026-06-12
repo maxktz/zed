@@ -167,6 +167,16 @@ impl PtyProcessInfo {
         Some(info)
     }
 
+    /// Forces a synchronous refresh of the PTY's foreground process group and
+    /// returns its info, bypassing the `current` cache. The cache is only
+    /// updated when the PTY emits output (see [`Self::emit_title_changed_if_changed`]),
+    /// so it can stay stale at an idle shell prompt after a child process such
+    /// as an agent exits. This does a single-pid refresh, cheap enough for the
+    /// infrequent checks that need an up-to-the-moment reading.
+    pub(crate) fn refresh_current(&self) -> Option<ProcessInfo> {
+        self.load()
+    }
+
     #[cfg(all(test, unix))]
     pub(crate) fn load_for_test(&self) -> Option<ProcessInfo> {
         self.load()

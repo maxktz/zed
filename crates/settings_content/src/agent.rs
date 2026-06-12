@@ -211,6 +211,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: left
     pub sidebar_side: Option<SidebarDockPosition>,
+    /// Whether to show the search input in the threads sidebar by default.
+    /// When disabled, the search input is still shown when searching threads.
+    ///
+    /// Default: true
+    pub show_threads_sidebar_search: Option<bool>,
     /// Default width in pixels when the agent panel is docked to the left or right.
     ///
     /// Default: 640

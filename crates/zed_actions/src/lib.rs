@@ -855,8 +855,8 @@ pub mod agents_sidebar {
     actions!(
         agents_sidebar,
         [
-            /// Moves focus to the sidebar's search/filter editor.
-            FocusSidebarFilter,
+            /// Focuses the threads search in the agents sidebar.
+            FocusThreadsSearch,
         ]
     );
 }

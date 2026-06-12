@@ -1021,6 +1021,8 @@
     "flexible": true,
     // Where to position the threads sidebar. Can be 'left' or 'right'.
     "sidebar_side": "left",
+    // Whether to show the search input in the threads sidebar by default.
+    "show_threads_sidebar_search": true,
     // Default width when the agent panel is docked to the left or right.
     "default_width": 640,
     // Default height when the agent panel is docked to the bottom.

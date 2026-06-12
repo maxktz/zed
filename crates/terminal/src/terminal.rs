@@ -42,7 +42,10 @@ use std::{
     ops::{BitOr, BitOrAssign, Deref, Range as StdRange},
     path::{Path, PathBuf},
     process::ExitStatus,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -848,6 +851,8 @@ impl Display for TerminalError {
 // https://github.com/alacritty/alacritty/blob/cb3a79dbf6472740daca8440d5166c1d4af5029e/extra/man/alacritty.5.scd?plain=1#L207-L213
 const DEFAULT_SCROLL_HISTORY_LINES: usize = 10_000;
 pub const MAX_SCROLL_HISTORY_LINES: usize = 100_000;
+const ZED_AGENT_SESSION_STATE_FILE_ENV: &str = "ZED_AGENT_SESSION_STATE_FILE";
+static NEXT_AGENT_SESSION_STATE_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 pub struct TerminalBuilder {
     terminal: Terminal,
@@ -938,6 +943,7 @@ impl TerminalBuilder {
             event_loop_task: Task::ready(Ok(())),
             background_executor: background_executor.clone(),
             path_style,
+            agent_session_state_path: None,
             #[cfg(any(test, feature = "test-support"))]
             input_log: Vec::new(),
         };
@@ -989,6 +995,17 @@ impl TerminalBuilder {
             }
 
             insert_zed_terminal_env(&mut env, &version);
+            let agent_session_state_path = (!is_remote_terminal && task.is_none()).then(|| {
+                let id = NEXT_AGENT_SESSION_STATE_FILE_ID.fetch_add(1, Ordering::Relaxed);
+                std::env::temp_dir().join(format!(
+                    "zed-agent-session-{}-{id}.json",
+                    std::process::id()
+                ))
+            });
+            if let Some(path) = agent_session_state_path.as_ref() {
+                let path = path.to_string_lossy().into_owned();
+                env.insert(ZED_AGENT_SESSION_STATE_FILE_ENV.to_string(), path);
+            }
 
             #[derive(Default)]
             struct ShellParams {
@@ -1161,6 +1178,7 @@ impl TerminalBuilder {
                 event_loop_task: Task::ready(Ok(())),
                 background_executor,
                 path_style,
+                agent_session_state_path,
                 #[cfg(any(test, feature = "test-support"))]
                 input_log: Vec::new(),
             };
@@ -1320,6 +1338,7 @@ pub struct Terminal {
     event_loop_task: Task<Result<(), anyhow::Error>>,
     background_executor: BackgroundExecutor,
     path_style: PathStyle,
+    agent_session_state_path: Option<PathBuf>,
     #[cfg(any(test, feature = "test-support"))]
     input_log: Vec<Vec<u8>>,
 }
@@ -2435,6 +2454,24 @@ impl Terminal {
                 .and_then(|process| foreground_process_command_from_argv(&process.argv)),
             TerminalType::DisplayOnly => None,
         }
+    }
+
+    /// Like [`Self::foreground_process_command_name`], but forces a fresh read
+    /// of the foreground process instead of using the output-driven cache. Use
+    /// when an up-to-the-moment answer is required (e.g. deciding whether an
+    /// agent session is still alive), since the cache only updates on PTY output
+    /// and can stay stale at an idle shell prompt after a child process exits.
+    pub fn refresh_foreground_process_command_name(&self) -> Option<String> {
+        match &self.terminal_type {
+            TerminalType::Pty { info, .. } => info
+                .refresh_current()
+                .and_then(|process| foreground_process_command_from_argv(&process.argv)),
+            TerminalType::DisplayOnly => None,
+        }
+    }
+
+    pub fn agent_session_state_path(&self) -> Option<&Path> {
+        self.agent_session_state_path.as_deref()
     }
 
     /// Returns the working directory of the process that's connected to the PTY.
