@@ -304,14 +304,18 @@ impl RenderOnce for ThreadItem {
                 .color(icon_color)
                 .into_any_element()
         } else if let Some(custom_svg) = self.custom_icon_from_external_svg {
+            // External agent SVGs (Claude, Codex, ...) fill their box edge to
+            // edge, while Zed's built-in icons have baked-in padding. Size them
+            // separately so every agent icon lands at a consistent ~13px visual
+            // size in the row, instead of the external ones looking oversized.
             Icon::from_external_svg(custom_svg)
                 .color(icon_color)
-                .size(IconSize::Small)
+                .size(IconSize::Custom(rems_from_px(13.)))
                 .into_any_element()
         } else {
             Icon::new(self.icon)
                 .color(icon_color)
-                .size(IconSize::Small)
+                .size(IconSize::Custom(rems_from_px(16.)))
                 .into_any_element()
         };
 
@@ -465,7 +469,6 @@ impl RenderOnce for ThreadItem {
                             this.child(
                                 h_flex()
                                     .relative()
-                                    .pr_1p5()
                                     .when(opaque_window, |this| {
                                         this.child(
                                             GradientFade::new(base_bg, hover_bg, hover_bg)

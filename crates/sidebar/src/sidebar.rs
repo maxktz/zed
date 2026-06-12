@@ -2388,8 +2388,9 @@ impl Sidebar {
             .relative()
             .h(Tab::content_height(cx))
             .w_full()
-            .pl_2()
-            .pr_1p5()
+            // Symmetric, and matches the thread/terminal rows' `px_1p5` so the
+            // header's left edge lines up with the rows below it.
+            .px_1p5()
             .justify_between()
             .border_1()
             .map(|this| {
@@ -2466,7 +2467,6 @@ impl Sidebar {
             .child(
                 h_flex()
                     .gap_px()
-                    .pr_1p5()
                     .children(opaque_window.then(|| gradient_overlay()))
                     .child(self.render_new_thread_button(ix, id_prefix, key, &group_name, cx))
                     .child(self.render_project_header_ellipsis_menu(
