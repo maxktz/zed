@@ -161,6 +161,7 @@ fn assert_remote_project_integration_sidebar_state(
                     "expected the only sidebar project header to be `project`"
                 );
             }
+            ListEntry::WorktreeHeader { .. } => {}
             ListEntry::Thread(thread)
                 if thread.metadata.session_id.as_ref() == Some(main_thread_id) =>
             {
@@ -551,6 +552,9 @@ fn visible_entries_as_strings(
             .entries
             .iter()
             .enumerate()
+            // Worktree group headers are presentation-only; keep them out of the
+            // textual snapshot so existing expectations stay stable.
+            .filter(|(_, entry)| !matches!(entry, ListEntry::WorktreeHeader { .. }))
             .map(|(ix, entry)| {
                 let selected = if sidebar.selection == Some(ix) {
                     "  <== selected"
@@ -558,6 +562,7 @@ fn visible_entries_as_strings(
                     ""
                 };
                 match entry {
+                    ListEntry::WorktreeHeader { .. } => String::new(),
                     ListEntry::ProjectHeader {
                         label,
                         key,
@@ -1294,49 +1299,31 @@ async fn test_keyboard_select_next_and_previous(cx: &mut TestAppContext) {
     multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
     cx.run_until_parked();
 
-    // Entries: [header, thread3, thread2, thread1]
+    // Entries: [project header, worktree header, thread3, thread2, thread1]
     // Focusing the sidebar does not set a selection; select_next/select_previous
     // handle None gracefully by starting from the first or last entry.
     focus_sidebar(&sidebar, cx);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), None);
 
-    // First SelectNext from None starts at index 0
+    // SelectNext from None starts at index 0 and steps through every entry.
+    for expected in [0, 1, 2, 3, 4] {
+        cx.dispatch_action(SelectNext);
+        assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(expected));
+    }
+
+    // At the end, wraps back to the first entry.
     cx.dispatch_action(SelectNext);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
 
-    // Move down through remaining entries
-    cx.dispatch_action(SelectNext);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(1));
-
-    cx.dispatch_action(SelectNext);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(2));
-
-    cx.dispatch_action(SelectNext);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(3));
-
-    // At the end, wraps back to first entry
-    cx.dispatch_action(SelectNext);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
-
-    // Navigate back to the end
-    cx.dispatch_action(SelectNext);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(1));
-    cx.dispatch_action(SelectNext);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(2));
-    cx.dispatch_action(SelectNext);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(3));
-
-    // Move back up
+    // At the top, SelectPrevious clears the selection (focus returns to editor).
     cx.dispatch_action(SelectPrevious);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(2));
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), None);
 
-    cx.dispatch_action(SelectPrevious);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(1));
-
-    cx.dispatch_action(SelectPrevious);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
-
-    // At the top, selection clears (focus returns to editor)
+    // From None, SelectPrevious selects the last entry, then walks back up.
+    for expected in [4, 3, 2, 1, 0] {
+        cx.dispatch_action(SelectPrevious);
+        assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(expected));
+    }
     cx.dispatch_action(SelectPrevious);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), None);
 }
@@ -1354,9 +1341,9 @@ async fn test_keyboard_select_first_and_last(cx: &mut TestAppContext) {
 
     focus_sidebar(&sidebar, cx);
 
-    // SelectLast jumps to the end
+    // SelectLast jumps to the end (entries: project header, worktree header, 3 threads)
     cx.dispatch_action(SelectLast);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(3));
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(4));
 
     // SelectFirst jumps to the beginning
     cx.dispatch_action(SelectFirst);
@@ -1513,11 +1500,13 @@ async fn test_keyboard_collapse_from_child_selects_parent(cx: &mut TestAppContex
     multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
     cx.run_until_parked();
 
-    // Focus sidebar (selection starts at None), then navigate down to the thread (child)
+    // Focus sidebar (selection starts at None), then navigate down to the thread
+    // (child). Entries: project header (0), worktree header (1), Thread 1 (2).
     focus_sidebar(&sidebar, cx);
     cx.dispatch_action(SelectNext);
     cx.dispatch_action(SelectNext);
-    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(1));
+    cx.dispatch_action(SelectNext);
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(2));
 
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
@@ -4194,7 +4183,8 @@ async fn test_escape_from_search_focuses_first_thread(cx: &mut TestAppContext) {
     cx.dispatch_action(Cancel);
     cx.run_until_parked();
     sidebar.update_in(cx, |sidebar, window, cx| {
-        assert_eq!(sidebar.selection, Some(1));
+        // Index 2: project header (0), worktree header (1), first thread (2).
+        assert_eq!(sidebar.selection, Some(2));
         assert!(sidebar.focus_handle.is_focused(window));
         assert!(!sidebar.filter_editor.read(cx).is_focused(window));
     });
@@ -4568,12 +4558,13 @@ async fn test_confirm_on_historical_thread_activates_workspace(cx: &mut TestAppC
         workspace_1
     );
 
-    // Confirm on the historical (non-live) thread at index 1.
+    // Confirm on the historical (non-live) thread at index 2 (project header 0,
+    // worktree header 1, thread 2).
     // Before a previous fix, the workspace field was Option<usize> and
     // historical threads had None, so activate_thread early-returned
     // without switching the workspace.
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.selection = Some(1);
+        sidebar.selection = Some(2);
         sidebar.confirm(&Confirm, window, cx);
     });
     cx.run_until_parked();
@@ -4750,7 +4741,8 @@ async fn test_confirm_on_historical_thread_in_new_project_group_opens_real_threa
     );
 
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.selection = Some(2);
+        // project-a header (0), project-b header (1), worktree header (2), thread (3).
+        sidebar.selection = Some(3);
         sidebar.confirm(&Confirm, window, cx);
     });
 
@@ -4974,7 +4966,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
                     thread.metadata.thread_id,
                     thread.metadata.display_title(),
                 )),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::WorktreeHeader { .. }
+                | ListEntry::Terminal(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -5060,7 +5054,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
             .iter()
             .find_map(|entry| match entry {
                 ListEntry::Thread(thread) => Some(thread),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::WorktreeHeader { .. }
+                | ListEntry::Terminal(_) => None,
             })
             .expect("renamed thread should match the search");
         let title = thread.metadata.display_title();
@@ -5099,7 +5095,9 @@ async fn test_rename_selected_thread_action_renames_selected_thread(cx: &mut Tes
             .enumerate()
             .find_map(|(ix, entry)| match entry {
                 ListEntry::Thread(thread) => Some((ix, thread.metadata.thread_id)),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::WorktreeHeader { .. }
+                | ListEntry::Terminal(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -6999,7 +6997,8 @@ async fn test_clicking_worktree_thread_opens_workspace_when_none_exists(cx: &mut
     // Focus the sidebar and select the worktree thread.
     focus_sidebar(&sidebar, cx);
     sidebar.update_in(cx, |sidebar, _window, _cx| {
-        sidebar.selection = Some(1); // index 0 is header, 1 is the thread
+        // index 0 project header, 1 worktree header, 2 the thread
+        sidebar.selection = Some(2);
     });
 
     // Confirm to open the worktree thread.
@@ -7121,6 +7120,7 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
                         "expected the only sidebar project header to be `project`"
                     );
                 }
+                ListEntry::WorktreeHeader { .. } => {}
                 ListEntry::Thread(thread)
                     if thread.metadata.title.as_ref().map(|t| t.as_ref()) == Some("WT Thread")
                         && thread
@@ -7243,10 +7243,19 @@ async fn test_clicking_absorbed_worktree_thread_activates_worktree_workspace(
     assert!(entries.contains(&"  Main Thread".to_string()));
     assert!(entries.contains(&"  WT Thread {wt-feature-a}".to_string()));
 
-    let wt_thread_index = entries
-        .iter()
-        .position(|e| e.contains("WT Thread"))
-        .expect("should find the worktree thread entry");
+    // Resolve the real entry index (worktree group headers are present in
+    // `contents.entries` but filtered out of the string snapshot).
+    let wt_thread_index = sidebar.read_with(cx, |sidebar, _| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::Thread(thread)
+                    if thread.metadata.display_title().as_ref().contains("WT Thread"))
+            })
+            .expect("should find the worktree thread entry")
+    });
 
     assert_eq!(
         multi_workspace.read_with(cx, |mw, _| mw.workspace().clone()),
@@ -12078,8 +12087,9 @@ async fn test_worktree_add_only_regroups_threads_for_changed_workspace(cx: &mut 
         visible_entries_as_strings(&sidebar, cx),
         vec![
             "v [project]",
-            "  Worktree Thread {wt-feature}",
+            // Worktree grouping sorts the main group ahead of the linked one.
             "  Main Thread",
+            "  Worktree Thread {wt-feature}",
         ]
     );
 

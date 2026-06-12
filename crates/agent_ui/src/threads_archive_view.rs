@@ -170,7 +170,7 @@ impl ThreadsArchiveView {
 
         let filter_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Search all threads…", window, cx);
+            editor.set_placeholder_text("Search all chats…", window, cx);
             // Single-line editors default to the code `buffer_line_height`
             // (comfortable = 1.618), which makes the text cursor too tall for a
             // UI input. Use a compact line height like the other search inputs.
@@ -894,14 +894,17 @@ impl ThreadsArchiveView {
             // Match the workspace tab bar height exactly so the search row and
             // the tab bar below it read as one continuous strip at any density.
             .h(Tab::container_height(cx))
-            .px_1p5()
+            .pr_1p5()
+            .pl_2()
             .gap_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(
-                Icon::new(IconName::MagnifyingGlass)
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
+                h_flex().size_4().flex_none().justify_center().child(
+                    Icon::new(IconName::MagnifyingGlass)
+                        .size(IconSize::Small)
+                        .color(Color::Placeholder),
+                ),
             )
             .child(div().min_w_0().flex_1().child(self.filter_editor.clone()))
             .when(show_focus_keybinding, |this| {

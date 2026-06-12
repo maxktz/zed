@@ -57,6 +57,7 @@ use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, GradientFade,
     HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
     Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
+    WorktreeKind,
     prelude::*, render_modifiers, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
@@ -413,6 +414,9 @@ enum ListEntry {
         is_active: bool,
         has_threads: bool,
     },
+    WorktreeHeader {
+        label: SharedString,
+    },
     Thread(Arc<ThreadEntry>),
     Terminal(TerminalEntry),
 }
@@ -440,7 +444,7 @@ impl ActivatableEntry {
                 metadata: terminal.metadata.clone(),
                 workspace: terminal.workspace.clone(),
             }),
-            ListEntry::ProjectHeader { .. } => None,
+            ListEntry::ProjectHeader { .. } | ListEntry::WorktreeHeader { .. } => None,
         }
     }
 
@@ -482,7 +486,9 @@ impl ListEntry {
     fn session_id(&self) -> Option<&acp::SessionId> {
         match self {
             ListEntry::Thread(thread_entry) => thread_entry.metadata.session_id.as_ref(),
-            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,
+            ListEntry::Terminal(_)
+            | ListEntry::ProjectHeader { .. }
+            | ListEntry::WorktreeHeader { .. } => None,
         }
     }
 
@@ -500,6 +506,7 @@ impl ListEntry {
                 ThreadEntryWorkspace::Open(workspace) => vec![workspace.clone()],
                 ThreadEntryWorkspace::Closed { .. } => Vec::new(),
             },
+            ListEntry::WorktreeHeader { .. } => Vec::new(),
             ListEntry::ProjectHeader { key, .. } => multi_workspace
                 .workspaces_for_project_group(key, cx)
                 .unwrap_or_default(),
@@ -540,6 +547,9 @@ enum EntryShape {
         // Determines whether the "No threads yet" row is rendered (only shown when
         // `!is_collapsed && !has_threads`).
         is_collapsed: bool,
+    },
+    WorktreeHeader {
+        label: SharedString,
     },
     Thread(ThreadId),
     Terminal(TerminalId),
@@ -708,6 +718,30 @@ fn workspace_menu_worktree_labels(
         .collect()
 }
 
+/// Compact "time ago" for the single-row chat item: "now", "5m", "2h", "3d",
+/// "1w", "4mo", "2y".
+fn format_time_ago(time: DateTime<Utc>) -> String {
+    let secs = (Utc::now() - time).num_seconds().max(0);
+    let mins = secs / 60;
+    let hours = mins / 60;
+    let days = hours / 24;
+    if mins < 1 {
+        "now".to_string()
+    } else if hours < 1 {
+        format!("{mins}m")
+    } else if days < 1 {
+        format!("{hours}h")
+    } else if days < 7 {
+        format!("{days}d")
+    } else if days < 30 {
+        format!("{}w", days / 7)
+    } else if days < 365 {
+        format!("{}mo", days / 30)
+    } else {
+        format!("{}y", days / 365)
+    }
+}
+
 fn apply_worktree_label_mode(
     mut worktrees: Vec<ThreadItemWorktreeInfo>,
     mode: AgentThreadWorktreeLabel,
@@ -823,7 +857,7 @@ impl Sidebar {
 
         let filter_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Search threads…", window, cx);
+            editor.set_placeholder_text("Search chats…", window, cx);
             // Single-line editors default to the code `buffer_line_height`
             // (comfortable = 1.618), which makes the text cursor too tall for a
             // UI input. Use a compact line height like the other search inputs.
@@ -2124,6 +2158,9 @@ impl Sidebar {
                     .map(|state| !state.expanded)
                     .unwrap_or(false),
             },
+            ListEntry::WorktreeHeader { label } => {
+                EntryShape::WorktreeHeader { label: label.clone() }
+            }
             ListEntry::Thread(thread) => EntryShape::Thread(thread.metadata.thread_id),
             ListEntry::Terminal(terminal) => EntryShape::Terminal(terminal.metadata.terminal_id),
         })
@@ -2273,6 +2310,17 @@ impl Sidebar {
                     cx,
                 )
             }
+            ListEntry::WorktreeHeader { label } => {
+                // The first worktree group in a project sits flush under the
+                // project header; later groups get a small gap above them.
+                let gap_above = ix > 0
+                    && !matches!(
+                        self.contents.entries.get(ix - 1),
+                        Some(ListEntry::ProjectHeader { .. })
+                    );
+                self.render_worktree_header(label, gap_above, cx)
+                    .into_any_element()
+            }
             ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
             ListEntry::Terminal(terminal) => {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
@@ -2313,6 +2361,51 @@ impl Sidebar {
                 .tooltip(Tooltip::text("Remote Project"))
                 .into_any_element(),
         )
+    }
+
+    /// A non-interactive grouping row that clusters a project's chats by
+    /// worktree. Mirrors the project header's height/padding so the left edges
+    /// line up, but has no buttons, disclosure, hover, or collapse.
+    fn render_worktree_header(
+        &self,
+        label: &SharedString,
+        gap_above: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let color = cx.theme().colors();
+        let sidebar_base_bg = color
+            .title_bar_background
+            .blend(color.panel_background.opacity(0.25));
+        let base_bg = color.background.blend(sidebar_base_bg);
+        let hover_solid = base_bg.blend(
+            color
+                .element_active
+                .blend(color.element_background.opacity(0.2)),
+        );
+
+        // Gap between consecutive worktree groups lives on a transparent
+        // wrapper (top padding) so it isn't clipped like a list-item margin
+        // and so the header's own hover background doesn't fill it.
+        div()
+            .when(gap_above, |this| this.pt(px(4.)))
+            .child(
+                h_flex()
+                    .h(px(26.))
+                    .w_full()
+                    .px_1p5()
+                    // Indent inside the padding so the bg stays full-width.
+                    .pl(px(19.))
+                    .gap_1()
+                    .hover(|s| s.bg(hover_solid))
+                    .child(
+                        h_flex().size_4().flex_none().justify_center().child(
+                            Icon::new(IconName::GitWorktree)
+                                .size(IconSize::XSmall)
+                                .color(Color::Placeholder),
+                        ),
+                    )
+                    .child(Label::new(label.clone()).color(Color::Placeholder)),
+            )
     }
 
     fn render_project_header(
@@ -2395,9 +2488,8 @@ impl Sidebar {
             .relative()
             .h(Tab::content_height(cx))
             .w_full()
-            // Symmetric, and matches the thread/terminal rows' `px_1p5` so the
-            // header's left edge lines up with the rows below it.
-            .px_1p5()
+            .pr_1p5()
+            .pl_2()
             .justify_between()
             .border_1()
             .map(|this| {
@@ -2415,9 +2507,11 @@ impl Sidebar {
                     .w_full()
                     .gap_1()
                     .child(
-                        Icon::new(IconName::Folder)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
+                        h_flex().size_4().flex_none().justify_center().child(
+                            Icon::new(IconName::Folder)
+                                .size(IconSize::Small)
+                                .color(Color::Placeholder),
+                        ),
                     )
                     .child(label)
                     .when_some(
@@ -3469,6 +3563,7 @@ impl Sidebar {
                 let key = key.clone();
                 self.toggle_collapse(&key, window, cx);
             }
+            ListEntry::WorktreeHeader { .. } => {}
             ListEntry::Thread(thread) => {
                 let metadata = thread.metadata.clone();
                 match &thread.workspace {
@@ -4207,7 +4302,9 @@ impl Sidebar {
                     self.update_entries(cx);
                 }
             }
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => {
+            Some(
+                ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::WorktreeHeader { .. },
+            ) => {
                 for i in (0..ix).rev() {
                     if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(i)
                     {
@@ -4234,7 +4331,9 @@ impl Sidebar {
         // Find the group header for the current selection.
         let header_ix = match self.contents.entries.get(ix) {
             Some(ListEntry::ProjectHeader { .. }) => Some(ix),
-            Some(ListEntry::Thread(_) | ListEntry::Terminal(_)) => (0..ix).rev().find(|&i| {
+            Some(
+                ListEntry::Thread(_) | ListEntry::Terminal(_) | ListEntry::WorktreeHeader { .. },
+            ) => (0..ix).rev().find(|&i| {
                 matches!(
                     self.contents.entries.get(i),
                     Some(ListEntry::ProjectHeader { .. })
@@ -5774,24 +5873,67 @@ impl Sidebar {
                 }
                 ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
                 ListEntry::Terminal(terminal) => terminal.metadata.display_time(),
-                ListEntry::ProjectHeader { .. } => unreachable!(),
+                ListEntry::ProjectHeader { .. } | ListEntry::WorktreeHeader { .. } => {
+                    unreachable!()
+                }
             }
         }
 
-        let row_entries = terminals
+        // The worktree a row groups under: its first worktree info. A linked
+        // worktree forms its own group keyed by path; the main worktree (or a
+        // row with no worktree info) falls under a "main" group.
+        fn worktree_group(entry: &ListEntry) -> (SharedString, SharedString, bool) {
+            let worktrees = match entry {
+                ListEntry::Thread(thread) => &thread.worktrees,
+                ListEntry::Terminal(terminal) => &terminal.worktrees,
+                ListEntry::ProjectHeader { .. } | ListEntry::WorktreeHeader { .. } => {
+                    unreachable!()
+                }
+            };
+            match worktrees.first() {
+                Some(info) if info.kind == WorktreeKind::Linked => {
+                    let label = info.worktree_name.clone().unwrap_or_else(|| "main".into());
+                    (info.full_path.clone(), label, false)
+                }
+                // NUL-prefixed sentinel can't collide with a real path.
+                _ => ("\0main".into(), "main".into(), true),
+            }
+        }
+
+        let mut row_entries: Vec<ListEntry> = terminals
             .into_iter()
             .map(ListEntry::Terminal)
             .chain(threads.into_iter().map(ListEntry::Thread))
-            .sorted_by_key(|right| std::cmp::Reverse(display_time(right)));
+            .collect();
+        row_entries.sort_by_key(|entry| std::cmp::Reverse(display_time(entry)));
 
+        // Bucket rows by worktree. Because rows are already newest-first, the
+        // first-seen order of buckets orders linked groups by recency.
+        let mut groups: Vec<(SharedString, SharedString, bool, Vec<ListEntry>)> = Vec::new();
         for entry in row_entries {
-            if let ListEntry::Thread(thread) = &entry {
-                if let Some(session_id) = &thread.metadata.session_id {
-                    current_session_ids.insert(session_id.clone());
-                }
-                current_thread_ids.insert(thread.metadata.thread_id);
+            let (key, label, is_main) = worktree_group(&entry);
+            if let Some(group) = groups.iter_mut().find(|group| group.0 == key) {
+                group.3.push(entry);
+            } else {
+                groups.push((key, label, is_main, vec![entry]));
             }
-            entries.push(entry);
+        }
+
+        // Main group always first; linked groups keep their recency order
+        // (stable sort preserves first-seen order among non-main groups).
+        groups.sort_by_key(|group| !group.2);
+
+        for (_key, label, _is_main, rows) in groups {
+            entries.push(ListEntry::WorktreeHeader { label });
+            for entry in rows {
+                if let ListEntry::Thread(thread) = &entry {
+                    if let Some(session_id) = &thread.metadata.session_id {
+                        current_session_ids.insert(session_id.clone());
+                    }
+                    current_thread_ids.insert(thread.metadata.thread_id);
+                }
+                entries.push(entry);
+            }
         }
     }
 
@@ -5832,6 +5974,7 @@ impl Sidebar {
                     current_header_key = Some(key.clone());
                     None
                 }
+                ListEntry::WorktreeHeader { .. } => None,
                 ListEntry::Thread(thread) => {
                     if thread.draft == Some(DraftKind::Empty) {
                         return None;
@@ -6195,7 +6338,7 @@ impl Sidebar {
         let timestamp: SharedString = if is_empty_draft {
             SharedString::default()
         } else {
-            format_history_entry_timestamp(Self::thread_display_time(&thread.metadata)).into()
+            format_time_ago(Self::thread_display_time(&thread.metadata)).into()
         };
 
         let is_remote = thread.workspace.is_remote(cx);
@@ -6218,6 +6361,14 @@ impl Sidebar {
 
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
+            .single_row(true)
+            .indent(px(18.))
+            // Title is muted unless this is the active thread.
+            .title_label_color(if is_selected {
+                Color::Default
+            } else {
+                Color::Muted
+            })
             .icon(icon)
             .when(is_draft, |this| {
                 this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
@@ -6232,12 +6383,6 @@ impl Sidebar {
             .highlight_positions(thread.highlight_positions.to_vec())
             .title_generating(title_generating)
             .notified(has_notification)
-            .when(thread.diff_stats.lines_added > 0, |this| {
-                this.added(thread.diff_stats.lines_added as usize)
-            })
-            .when(thread.diff_stats.lines_removed > 0, |this| {
-                this.removed(thread.diff_stats.lines_removed as usize)
-            })
             .selected(is_selected)
             .focused(is_focused)
             .hovered(is_hovered)
@@ -6527,7 +6672,7 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = ElementId::from(format!("terminal-{}", terminal.metadata.terminal_id));
-        let timestamp = format_history_entry_timestamp(terminal.metadata.display_time());
+        let timestamp = format_time_ago(terminal.metadata.display_time());
         let is_hovered = self.hovered_thread_index == Some(ix);
         let color = cx.theme().colors();
         let sidebar_bg = color
@@ -6556,6 +6701,14 @@ impl Sidebar {
 
         ThreadItem::new(id, title)
             .base_bg(sidebar_bg)
+            .single_row(true)
+            .indent(px(18.))
+            // Title is muted unless this is the active terminal.
+            .title_label_color(if is_active {
+                Color::Default
+            } else {
+                Color::Muted
+            })
             .icon(terminal.icon)
             .when_some(terminal.icon_from_external_svg.clone(), |this, svg| {
                 this.custom_icon_from_external_svg(svg)
@@ -7308,7 +7461,7 @@ impl Sidebar {
                 let workspace = terminal.workspace.clone();
                 self.activate_terminal_entry(metadata, workspace, true, window, cx);
             }
-            ListEntry::ProjectHeader { .. } => {}
+            ListEntry::ProjectHeader { .. } | ListEntry::WorktreeHeader { .. } => {}
         }
     }
 
@@ -7420,14 +7573,17 @@ impl Sidebar {
             // Match the workspace tab bar height exactly so the search row and
             // the tab bar below it read as one continuous strip at any density.
             .h(Tab::container_height(cx))
-            .px_1p5()
+            .pr_1p5()
+            .pl_2()
             .gap_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(
-                Icon::new(IconName::MagnifyingGlass)
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
+                h_flex().size_4().flex_none().justify_center().child(
+                    Icon::new(IconName::MagnifyingGlass)
+                        .size(IconSize::Small)
+                        .color(Color::Placeholder),
+                ),
             )
             .child(self.render_filter_input(cx))
             .when(
