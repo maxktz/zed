@@ -830,7 +830,7 @@ impl TitleBar {
                         )
                     })
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                    .when(!is_project_selected, |s| s.color(Color::Muted)),
+                    .color(Color::Muted),
                 move |_window, cx| {
                     Tooltip::for_action("Recent Projects", &zed_actions::OpenRecent::default(), cx)
                 },
@@ -842,7 +842,7 @@ impl TitleBar {
     fn render_recent_projects_popover(
         &self,
         display_name: String,
-        is_project_selected: bool,
+        _is_project_selected: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let workspace = self.workspace.clone();
@@ -881,7 +881,7 @@ impl TitleBar {
                         )
                     })
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                    .when(!is_project_selected, |s| s.color(Color::Muted)),
+                    .color(Color::Muted),
                 move |_window, cx| {
                     Tooltip::for_action("Recent Projects", &zed_actions::OpenRecent::default(), cx)
                 },
