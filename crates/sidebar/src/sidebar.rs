@@ -54,7 +54,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use theme::ActiveTheme;
 use ui::{
-    AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
+    AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, GradientFade,
     HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
     Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
     prelude::*, render_modifiers, right_click_menu,
@@ -7365,8 +7365,6 @@ impl Sidebar {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let has_query = self.has_filter_query(cx);
-        let show_search = self.should_show_search(window, cx);
         let sidebar_on_left = self.side(cx) == SidebarSide::Left;
         let sidebar_on_right = self.side(cx) == SidebarSide::Right;
         let not_fullscreen = !window.is_fullscreen();
@@ -7395,46 +7393,47 @@ impl Sidebar {
             .when(!right_window_controls, |this| this.pr_1p5())
             .gap_1()
             .when(!no_open_projects, |this| {
-                this.border_b_1()
-                    .border_color(cx.theme().colors().border)
-                    .when(traffic_lights && show_search, |this| {
-                        this.child(Divider::vertical().color(ui::DividerColor::Border))
-                    })
-                    .when(show_search, |this| {
-                        this.child(
-                            div().ml_1().child(
-                                Icon::new(IconName::MagnifyingGlass)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            ),
-                        )
-                        .child(self.render_filter_input(cx))
-                    })
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .when(
-                                show_search
-                                    && self.selection.is_some()
-                                    && !self.filter_editor.focus_handle(cx).is_focused(window),
-                                |this| this.child(KeyBinding::for_action(&FocusThreadsSearch, cx)),
-                            )
-                            .when(has_query, |this| {
-                                this.child(
-                                    IconButton::new("clear_filter", IconName::Close)
-                                        .icon_size(IconSize::Small)
-                                        .tooltip(Tooltip::text("Clear Search"))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.reset_filter_editor_text(window, cx);
-                                            this.search_revealed = false;
-                                            this.update_entries(cx);
-                                        })),
-                                )
-                            }),
-                    )
+                this.border_b_1().border_color(cx.theme().colors().border)
             })
             .when(right_window_controls, |this| {
                 this.children(Self::render_right_window_controls(window, cx))
+            })
+    }
+
+    fn render_search(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_query = self.has_filter_query(cx);
+
+        h_flex()
+            .w_full()
+            // Match the workspace tab bar height exactly so the search row and
+            // the tab bar below it read as one continuous strip at any density.
+            .h(Tab::container_height(cx))
+            .px_1p5()
+            .gap_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                Icon::new(IconName::MagnifyingGlass)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(self.render_filter_input(cx))
+            .when(
+                self.selection.is_some()
+                    && !self.filter_editor.focus_handle(cx).is_focused(window),
+                |this| this.child(KeyBinding::for_action(&FocusThreadsSearch, cx)),
+            )
+            .when(has_query, |this| {
+                this.child(
+                    IconButton::new("clear_filter", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Clear Search"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.reset_filter_editor_text(window, cx);
+                            this.search_revealed = false;
+                            this.update_entries(cx);
+                        })),
+                )
             })
     }
 
@@ -7931,6 +7930,7 @@ impl Render for Sidebar {
 
         let no_open_projects = !self.contents.has_open_projects;
         let no_search_results = self.contents.entries.is_empty();
+        let show_search = self.should_show_search(window, cx);
 
         v_flex()
             .id("workspace-sidebar")
@@ -7973,6 +7973,9 @@ impl Render for Sidebar {
             .map(|this| match &self.view {
                 SidebarView::ThreadList => this
                     .child(self.render_sidebar_header(no_open_projects, window, cx))
+                    .when(!no_open_projects && show_search, |this| {
+                        this.child(self.render_search(window, cx))
+                    })
                     .map(|this| {
                         if no_open_projects {
                             this.child(self.render_empty_state(cx))

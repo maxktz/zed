@@ -840,7 +840,6 @@ impl ThreadsArchiveView {
     }
 
     fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let has_query = !self.filter_editor.read(cx).text(cx).is_empty();
         let sidebar_on_left = matches!(
             AgentSettings::get_global(cx).sidebar_side(),
             settings::SidebarSide::Left
@@ -852,8 +851,6 @@ impl ThreadsArchiveView {
         let right_window_controls =
             !cfg!(target_os = "macos") && not_fullscreen && sidebar_on_right;
         let header_height = platform_title_bar_height(window);
-        let show_focus_keybinding =
-            self.selection.is_some() && !self.filter_editor.focus_handle(cx).is_focused(window);
 
         h_flex()
             .h(header_height)
@@ -873,25 +870,33 @@ impl ThreadsArchiveView {
             })
             .when(!right_window_controls, |this| this.pr_1p5())
             .gap_1()
-            .justify_between()
             .border_b_1()
             .border_color(cx.theme().colors().border)
-            .when(traffic_lights, |this| {
-                this.child(Divider::vertical().color(ui::DividerColor::Border))
+            .when(right_window_controls, |this| {
+                this.children(Self::render_right_window_controls(window, cx))
             })
+    }
+
+    fn render_search(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_query = !self.filter_editor.read(cx).text(cx).is_empty();
+        let show_focus_keybinding =
+            self.selection.is_some() && !self.filter_editor.focus_handle(cx).is_focused(window);
+
+        h_flex()
+            .w_full()
+            // Match the workspace tab bar height exactly so the search row and
+            // the tab bar below it read as one continuous strip at any density.
+            .h(Tab::container_height(cx))
+            .px_1p5()
+            .gap_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
             .child(
-                h_flex()
-                    .ml_1()
-                    .min_w_0()
-                    .w_full()
-                    .gap_1()
-                    .child(
-                        Icon::new(IconName::MagnifyingGlass)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(self.filter_editor.clone()),
+                Icon::new(IconName::MagnifyingGlass)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
             )
+            .child(div().min_w_0().flex_1().child(self.filter_editor.clone()))
             .when(show_focus_keybinding, |this| {
                 this.child(KeyBinding::for_action(&FocusThreadsSearch, cx))
             })
@@ -905,9 +910,6 @@ impl ThreadsArchiveView {
                             this.update_items(cx);
                         })),
                 )
-            })
-            .when(right_window_controls, |this| {
-                this.children(Self::render_right_window_controls(window, cx))
             })
     }
 
@@ -1080,6 +1082,7 @@ impl Render for ThreadsArchiveView {
             .on_action(cx.listener(Self::archive_selected_thread))
             .size_full()
             .child(self.render_header(window, cx))
+            .child(self.render_search(window, cx))
             .when(!has_query, |this| this.child(self.render_toolbar(cx)))
             .child(content)
     }
