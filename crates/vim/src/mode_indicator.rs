@@ -1,8 +1,9 @@
 use gpui::{
     App, Context, Element, Entity, FontWeight, Render, Subscription, WeakEntity, Window, div,
 };
+use settings::Settings as _;
 use ui::text_for_keystrokes;
-use workspace::{HideStatusItem, StatusItemView, item::ItemHandle, ui::prelude::*};
+use workspace::{HideStatusItem, StatusBarSettings, StatusItemView, item::ItemHandle, ui::prelude::*};
 
 use crate::{Vim, VimEvent, VimGlobals};
 
@@ -89,6 +90,10 @@ impl ModeIndicator {
 
 impl Render for ModeIndicator {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !StatusBarSettings::get_global(cx).vim_mode_indicator {
+            return div().hidden().into_any_element();
+        }
+
         let vim = self.vim();
         let Some(vim) = vim else {
             return div().hidden().into_any_element();

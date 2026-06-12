@@ -517,6 +517,10 @@ pub struct StatusBarSettingsContent {
     ///
     /// Default: non_utf8
     pub active_encoding_button: Option<EncodingDisplayOptions>,
+    /// Whether to show the vim mode indicator in the status bar.
+    ///
+    /// Default: true
+    pub vim_mode_indicator: Option<bool>,
 }
 
 #[derive(

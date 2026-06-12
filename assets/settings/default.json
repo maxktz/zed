@@ -1774,6 +1774,8 @@
     "line_endings_button": false,
     // Control when to show the active encoding in the status bar.
     "active_encoding_button": "non_utf8",
+    // Whether to show the vim mode indicator in the status bar.
+    "vim_mode_indicator": true,
   },
   // Settings specific to the terminal
   "terminal": {
