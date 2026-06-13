@@ -39,6 +39,9 @@ pub struct ThreadItem {
     icon_char: Option<SharedString>,
     icon_color: Option<Color>,
     icon_visible: bool,
+    /// When set, the agent icon shown in the idle/default state is omitted
+    /// entirely; only state icons (running/error/waiting/notified) render.
+    hide_default_icon: bool,
     custom_icon_from_external_svg: Option<SharedString>,
     title: SharedString,
     title_slot: Option<AnyElement>,
@@ -76,6 +79,7 @@ impl ThreadItem {
             icon_char: None,
             icon_color: None,
             icon_visible: true,
+            hide_default_icon: false,
             custom_icon_from_external_svg: None,
             title: title.into(),
             title_slot: None,
@@ -140,6 +144,11 @@ impl ThreadItem {
 
     pub fn icon_color(mut self, color: Color) -> Self {
         self.icon_color = Some(color);
+        self
+    }
+
+    pub fn hide_default_icon(mut self, hide: bool) -> Self {
+        self.hide_default_icon = hide;
         self
     }
 
@@ -382,6 +391,10 @@ impl RenderOnce for ThreadItem {
                 .into_any_element()
         } else if let Some(status_icon) = status_icon {
             icon_container().child(status_icon).into_any_element()
+        } else if self.hide_default_icon {
+            // Keep the icon's reserved space so the title doesn't shift; just
+            // omit the glyph in the idle/default state.
+            icon_container().into_any_element()
         } else {
             icon_container().child(agent_icon).into_any_element()
         };

@@ -6370,6 +6370,7 @@ impl Sidebar {
                 Color::Muted
             })
             .icon(icon)
+            .hide_default_icon(!is_draft)
             .when(is_draft, |this| {
                 this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
             })
@@ -6710,6 +6711,7 @@ impl Sidebar {
                 Color::Muted
             })
             .icon(terminal.icon)
+            .hide_default_icon(true)
             .when_some(terminal.icon_from_external_svg.clone(), |this, svg| {
                 this.custom_icon_from_external_svg(svg)
             })
