@@ -1,8 +1,8 @@
 use crate::{CommonAnimationExt, DiffStat, GradientFade, HighlightedLabel, Tooltip, prelude::*};
 
 use gpui::{
-    Animation, AnimationExt, ClickEvent, Hsla, MouseButton, Pixels, SharedString,
-    WindowBackgroundAppearance, px, pulsating_between,
+    Animation, AnimationExt, ClickEvent, Hsla, MouseButton, SharedString,
+    WindowBackgroundAppearance, pulsating_between,
 };
 use itertools::Itertools as _;
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -39,9 +39,6 @@ pub struct ThreadItem {
     icon_char: Option<SharedString>,
     icon_color: Option<Color>,
     icon_visible: bool,
-    /// When set, the agent icon shown in the idle/default state is omitted
-    /// entirely; only state icons (running/error/waiting/notified) render.
-    hide_default_icon: bool,
     custom_icon_from_external_svg: Option<SharedString>,
     title: SharedString,
     title_slot: Option<AnyElement>,
@@ -67,8 +64,6 @@ pub struct ThreadItem {
     on_hover: Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>,
     action_slot: Option<AnyElement>,
     base_bg: Option<Hsla>,
-    single_row: bool,
-    indent: Pixels,
 }
 
 impl ThreadItem {
@@ -79,7 +74,6 @@ impl ThreadItem {
             icon_char: None,
             icon_color: None,
             icon_visible: true,
-            hide_default_icon: false,
             custom_icon_from_external_svg: None,
             title: title.into(),
             title_slot: None,
@@ -105,24 +99,7 @@ impl ThreadItem {
             on_hover: Box::new(|_, _, _| {}),
             action_slot: None,
             base_bg: None,
-            single_row: false,
-            indent: px(0.),
         }
-    }
-
-    /// Collapses the item to a single row: icon + title on the left, the
-    /// timestamp on the right (covered by the action slot's gradient on hover).
-    /// Drops the second metadata row entirely.
-    pub fn single_row(mut self, single_row: bool) -> Self {
-        self.single_row = single_row;
-        self
-    }
-
-    /// Extra left padding applied inside the row so nested items read as a tree
-    /// while the row background still spans the full width.
-    pub fn indent(mut self, indent: Pixels) -> Self {
-        self.indent = indent;
-        self
     }
 
     pub fn timestamp(mut self, timestamp: impl Into<SharedString>) -> Self {
@@ -144,11 +121,6 @@ impl ThreadItem {
 
     pub fn icon_color(mut self, color: Color) -> Self {
         self.icon_color = Some(color);
-        self
-    }
-
-    pub fn hide_default_icon(mut self, hide: bool) -> Self {
-        self.hide_default_icon = hide;
         self
     }
 
@@ -325,36 +297,21 @@ impl RenderOnce for ThreadItem {
                 .justify_center()
                 .when(!icon_visible, |this| this.invisible())
         };
-        let icon_color = self.icon_color.unwrap_or(if self.single_row {
-            Color::Placeholder
-        } else {
-            Color::Muted
-        });
-        // Single-row items shrink the icon to match the surrounding 14px
-        // (`IconSize::Small`) UI icons; the regular layout uses the larger size.
-        let (builtin_icon_px, external_icon_px) = if self.single_row {
-            (14., 11.5)
-        } else {
-            (16., 13.)
-        };
+        let icon_color = self.icon_color.unwrap_or(Color::Muted);
         let agent_icon = if let Some(icon_char) = self.icon_char {
             Label::new(icon_char)
                 .size(LabelSize::Small)
                 .color(icon_color)
                 .into_any_element()
         } else if let Some(custom_svg) = self.custom_icon_from_external_svg {
-            // External agent SVGs (Claude, Codex, ...) fill their box edge to
-            // edge, while Zed's built-in icons have baked-in padding. Size them
-            // separately so every agent icon lands at a consistent visual size
-            // in the row, instead of the external ones looking oversized.
             Icon::from_external_svg(custom_svg)
                 .color(icon_color)
-                .size(IconSize::Custom(rems_from_px(external_icon_px)))
+                .size(IconSize::Small)
                 .into_any_element()
         } else {
             Icon::new(self.icon)
                 .color(icon_color)
-                .size(IconSize::Custom(rems_from_px(builtin_icon_px)))
+                .size(IconSize::Small)
                 .into_any_element()
         };
 
@@ -391,10 +348,6 @@ impl RenderOnce for ThreadItem {
                 .into_any_element()
         } else if let Some(status_icon) = status_icon {
             icon_container().child(status_icon).into_any_element()
-        } else if self.hide_default_icon {
-            // Keep the icon's reserved space so the title doesn't shift; just
-            // omit the glyph in the idle/default state.
-            icon_container().into_any_element()
         } else {
             icon_container().child(agent_icon).into_any_element()
         };
@@ -471,85 +424,6 @@ impl RenderOnce for ThreadItem {
             || has_diff_stats
             || has_timestamp;
 
-        if self.single_row {
-            let timestamp_label = has_timestamp.then(|| {
-                Label::new(timestamp.clone())
-                    .size(LabelSize::Small)
-                    .color(Color::Disabled)
-            });
-            let action_slot = self.action_slot;
-            let hovered = self.hovered;
-            let on_click = self.on_click;
-
-            return v_flex()
-                .id(self.id.clone())
-                .cursor_pointer()
-                .when_some(on_click, |this, on_click| this.on_click(on_click))
-                .group("thread-item")
-                .relative()
-                .flex_shrink_0()
-                .overflow_hidden()
-                .w_full()
-                .h(crate::Tab::content_height(cx))
-                .justify_center()
-                .px_1p5()
-                .pr_2()
-                .when(self.indent > px(0.), |this| this.pl(self.indent))
-                .when(self.selected, |s| s.bg(color.element_active))
-                .border_1()
-                .border_color(gpui::transparent_black())
-                .when(self.focused, |s| s.border_color(color.border_focused))
-                .when(self.rounded, |s| s.rounded_sm())
-                .hover(|s| s.bg(hover_color))
-                .on_hover(self.on_hover)
-                .child(
-                    h_flex()
-                        .min_w_0()
-                        .w_full()
-                        .h_6()
-                        .gap_2()
-                        .justify_between()
-                        .child(
-                            h_flex()
-                                .id("content")
-                                .min_w_0()
-                                .flex_1()
-                                .gap_1()
-                                .child(icon)
-                                .child(title_label),
-                        )
-                        .when(self.is_truncated && opaque_window, |this| {
-                            this.child(gradient_overlay)
-                        })
-                        .child(
-                            h_flex()
-                                .relative()
-                                .flex_none()
-                                .when(!hovered, |this| {
-                                    this.when_some(timestamp_label, |this, label| this.child(label))
-                                })
-                                .when(hovered, |this| {
-                                    this.when_some(action_slot, |this, slot| {
-                                        this.when(opaque_window, |this| {
-                                            this.child(
-                                                GradientFade::new(base_bg, hover_bg, hover_bg)
-                                                    .width(px(120.0))
-                                                    .right(px(8.))
-                                                    .gradient_stop(0.90)
-                                                    .group_name("thread-item"),
-                                            )
-                                        })
-                                        .child(slot)
-                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                            cx.stop_propagation()
-                                        })
-                                    })
-                                }),
-                        ),
-                )
-                .into_any_element();
-        }
-
         v_flex()
             .id(self.id.clone())
             .cursor_pointer()
@@ -591,6 +465,7 @@ impl RenderOnce for ThreadItem {
                             this.child(
                                 h_flex()
                                     .relative()
+                                    .pr_1p5()
                                     .when(opaque_window, |this| {
                                         this.child(
                                             GradientFade::new(base_bg, hover_bg, hover_bg)
@@ -756,7 +631,6 @@ impl RenderOnce for ThreadItem {
                 }))
             })
             .when_some(self.on_click, |this, on_click| this.on_click(on_click))
-            .into_any_element()
     }
 }
 

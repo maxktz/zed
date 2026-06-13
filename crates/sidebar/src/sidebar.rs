@@ -1,4 +1,7 @@
+mod chat_item;
 mod thread_switcher;
+
+use chat_item::ChatItem;
 
 use acp_thread::ThreadStatus;
 use action_log::DiffStats;
@@ -24,9 +27,7 @@ use agent_ui::{
 use agent_ui::{MessageEditorEvent, StateChange, thread_worktree_archive};
 use chrono::{DateTime, Utc};
 use editor::Editor;
-use feature_flags::{
-    AgentThreadWorktreeLabel, AgentThreadWorktreeLabelFlag, FeatureFlag, FeatureFlagAppExt as _,
-};
+use feature_flags::{AgentThreadWorktreeLabelFlag, FeatureFlag};
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, DismissEvent, Entity, EntityId, FocusHandle,
     Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task, TaskExt,
@@ -56,7 +57,7 @@ use theme::ActiveTheme;
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, GradientFade,
     HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
-    Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
+    Scrollbars, Tab, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
     WorktreeKind,
     prelude::*, render_modifiers, right_click_menu,
 };
@@ -219,19 +220,6 @@ enum ThreadEntryWorkspace {
     },
 }
 
-impl ThreadEntryWorkspace {
-    fn is_remote(&self, cx: &App) -> bool {
-        match self {
-            ThreadEntryWorkspace::Open(workspace) => {
-                !workspace.read(cx).project().read(cx).is_local()
-            }
-            ThreadEntryWorkspace::Closed {
-                project_group_key, ..
-            } => project_group_key.host().is_some(),
-        }
-    }
-}
-
 /// If the title begins with a decorative prefix (such as a leading emoji,
 /// spinner glyph, or symbol the agent prefixed the title with), splits that
 /// prefix off so a single representative glyph can be displayed in place of the
@@ -260,17 +248,6 @@ fn split_leading_icon_char(
         trimmed_title.to_string().into(),
         adjusted_positions,
     ))
-}
-
-fn terminal_agent_id(display_name: &str) -> Option<AgentId> {
-    // These must match the ACP registry/server IDs used by the new-thread
-    // picker and the ACP chat rows, so terminal-agent rows resolve the exact
-    // same icon SVG. See `agent_servers::custom::{CLAUDE_AGENT_ID, CODEX_ID}`.
-    match display_name {
-        "Claude" => Some(AgentId::new("claude-acp")),
-        "Codex" => Some(AgentId::new("codex-acp")),
-        _ => None,
-    }
 }
 
 /// Picks a single glyph to render as the icon from a detected title prefix.
@@ -375,8 +352,6 @@ struct ThreadEntry {
 #[derive(Clone)]
 struct TerminalEntry {
     metadata: TerminalThreadMetadata,
-    icon: IconName,
-    icon_from_external_svg: Option<SharedString>,
     workspace: ThreadEntryWorkspace,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     has_notification: bool,
@@ -740,30 +715,6 @@ fn format_time_ago(time: DateTime<Utc>) -> String {
     } else {
         format!("{}y", days / 365)
     }
-}
-
-fn apply_worktree_label_mode(
-    mut worktrees: Vec<ThreadItemWorktreeInfo>,
-    mode: AgentThreadWorktreeLabel,
-) -> Vec<ThreadItemWorktreeInfo> {
-    match mode {
-        AgentThreadWorktreeLabel::Both => {}
-        AgentThreadWorktreeLabel::Worktree => {
-            for wt in &mut worktrees {
-                wt.branch_name = None;
-            }
-        }
-        AgentThreadWorktreeLabel::Branch => {
-            for wt in &mut worktrees {
-                // Fall back to showing the worktree name when no branch is
-                // known; an empty chip would be worse than a mismatched icon.
-                if wt.branch_name.is_some() {
-                    wt.worktree_name = None;
-                }
-            }
-        }
-    }
-    worktrees
 }
 
 /// Shows a [`RemoteConnectionModal`] on the given workspace and establishes
@@ -1537,14 +1488,6 @@ impl Sidebar {
                 linked_worktree_path_lists_for_workspaces(group_workspaces, cx);
             let make_terminal_entry =
                 |metadata: TerminalThreadMetadata, workspace: ThreadEntryWorkspace| {
-                    let (icon, icon_from_external_svg) = metadata
-                        .agent_restore_state
-                        .as_ref()
-                        .and_then(|restore_state| {
-                            terminal_agent_id(restore_state.agent.display_name())
-                        })
-                        .map(|agent_id| resolve_agent_icon(&agent_id))
-                        .unwrap_or((IconName::Terminal, None));
                     let worktrees =
                         worktree_info_from_thread_paths(&metadata.worktree_paths, &branch_by_path);
                     let has_notification =
@@ -1555,8 +1498,6 @@ impl Sidebar {
                         .unwrap_or_default();
                     TerminalEntry {
                         metadata,
-                        icon,
-                        icon_from_external_svg,
                         workspace,
                         worktrees,
                         has_notification,
@@ -6330,28 +6271,10 @@ impl Sidebar {
 
         let id = SharedString::from(format!("thread-entry-{}", ix));
 
-        let color = cx.theme().colors();
-        let sidebar_bg = color
-            .title_bar_background
-            .blend(color.panel_background.opacity(0.25));
-
         let timestamp: SharedString = if is_empty_draft {
             SharedString::default()
         } else {
             format_time_ago(Self::thread_display_time(&thread.metadata)).into()
-        };
-
-        let is_remote = thread.workspace.is_remote(cx);
-
-        let worktrees = apply_worktree_label_mode(
-            thread.worktrees.clone(),
-            cx.flag_value::<AgentThreadWorktreeLabelFlag>(),
-        );
-
-        let (icon, icon_svg) = if is_draft {
-            (IconName::Circle, None)
-        } else {
-            (thread.icon, thread.icon_from_external_svg.clone())
         };
 
         let title_generating = thread.is_title_generating
@@ -6359,27 +6282,20 @@ impl Sidebar {
                 .regenerating_titles
                 .contains(&thread.metadata.thread_id);
 
-        let thread_item = ThreadItem::new(id, title.clone())
-            .base_bg(sidebar_bg)
-            .single_row(true)
+        let thread_item = ChatItem::new(id, title.clone())
             .indent(px(18.))
             // Title is muted unless this is the active thread.
-            .title_label_color(if is_selected {
+            .title_color(if is_selected {
                 Color::Default
             } else {
                 Color::Muted
             })
-            .icon(icon)
-            .hide_default_icon(!is_draft)
+            // Drafts show a faint placeholder dot; other idle threads show no icon.
+            .idle_icon(is_draft.then_some(IconName::Circle))
             .when(is_draft, |this| {
-                this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
+                this.idle_icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
             })
             .status(thread.status)
-            .is_remote(is_remote)
-            .when_some(icon_svg, |this, svg| {
-                this.custom_icon_from_external_svg(svg)
-            })
-            .worktrees(worktrees)
             .timestamp(timestamp)
             .highlight_positions(thread.highlight_positions.to_vec())
             .title_generating(title_generating)
@@ -6396,7 +6312,7 @@ impl Sidebar {
                 cx.notify();
             }))
             .when(is_renaming, |this| {
-                this.is_truncated(false).title_slot(
+                this.title_slot(
                     div()
                         .h_full()
                         .min_w_0()
@@ -6675,50 +6591,27 @@ impl Sidebar {
         let id = ElementId::from(format!("terminal-{}", terminal.metadata.terminal_id));
         let timestamp = format_time_ago(terminal.metadata.display_time());
         let is_hovered = self.hovered_thread_index == Some(ix);
-        let color = cx.theme().colors();
-        let sidebar_bg = color
-            .title_bar_background
-            .blend(color.panel_background.opacity(0.25));
         let metadata = terminal.metadata.clone();
         let workspace = terminal.workspace.clone();
         let focus_handle = self.focus_handle.clone();
-        let worktrees = apply_worktree_label_mode(
-            terminal.worktrees.clone(),
-            cx.flag_value::<AgentThreadWorktreeLabelFlag>(),
-        );
-        let is_remote = terminal.workspace.is_remote(cx);
-
         let display_title = terminal.metadata.display_title();
-        let (icon_char, title, highlight_positions) =
+        // Strip any leading glyph from the title; the minimal row keeps the
+        // idle icon slot empty, so the glyph itself isn't rendered.
+        let (title, highlight_positions) =
             match split_leading_icon_char(&display_title, &terminal.highlight_positions) {
-                Some((icon_char, title, positions)) => (Some(icon_char), title, positions),
-                None => (None, display_title, terminal.highlight_positions.clone()),
+                Some((_icon_char, title, positions)) => (title, positions),
+                None => (display_title, terminal.highlight_positions.clone()),
             };
-        let icon_char = terminal
-            .icon_from_external_svg
-            .is_none()
-            .then_some(icon_char)
-            .flatten();
 
-        ThreadItem::new(id, title)
-            .base_bg(sidebar_bg)
-            .single_row(true)
+        ChatItem::new(id, title)
             .indent(px(18.))
             // Title is muted unless this is the active terminal.
-            .title_label_color(if is_active {
+            .title_color(if is_active {
                 Color::Default
             } else {
                 Color::Muted
             })
-            .icon(terminal.icon)
-            .hide_default_icon(true)
-            .when_some(terminal.icon_from_external_svg.clone(), |this, svg| {
-                this.custom_icon_from_external_svg(svg)
-            })
-            .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
-            .is_remote(is_remote)
             .status(terminal.status)
-            .worktrees(worktrees)
             .timestamp(timestamp)
             .notified(terminal.has_notification)
             .highlight_positions(highlight_positions)
