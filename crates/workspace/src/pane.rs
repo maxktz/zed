@@ -2825,7 +2825,8 @@ impl Pane {
             };
 
             Some(DecoratedIcon::new(
-                icon.size(IconSize::Small).color(Color::Muted),
+                icon.size(IconSize::Custom(rems_from_px(11.)))
+                    .color(Color::Muted),
                 Some(
                     IconDecoration::new(icon_decoration, knockout_item_color, cx)
                         .color(icon_color.color(cx))
@@ -2845,7 +2846,7 @@ impl Pane {
                     .tab_icon(window, cx)
                     .map(|icon| icon.color(Color::Muted)),
             }
-            .map(|icon| icon.size(IconSize::Small))
+            .map(|icon| icon.size(IconSize::Custom(rems_from_px(11.))))
         } else {
             None
         };
@@ -2866,7 +2867,7 @@ impl Pane {
                 .size(ButtonSize::None)
                 .shape(IconButtonShape::Square)
                 .icon_color(Color::Muted)
-                .icon_size(IconSize::Small)
+                .icon_size(IconSize::Custom(rems_from_px(11.)))
                 .disabled(!toggleable)
                 .tooltip(move |_, cx| {
                     if toggleable {
@@ -2981,21 +2982,25 @@ impl Pane {
                 this.drag_split_direction = None;
                 this.handle_external_paths_drop(paths, window, cx)
             }))
-            .start_slot::<Indicator>(indicator)
             .map(|this| {
                 let end_slot_action: &'static dyn Action;
                 let end_slot_tooltip_text: &'static str;
-                let end_slot = if is_pinned {
+
+                // Trailing button: pin toggle for pinned tabs, otherwise the
+                // close button (absent when close buttons are hidden entirely).
+                let button = if is_pinned {
                     end_slot_action = &TogglePinTab;
                     end_slot_tooltip_text = "Unpin Tab";
-                    IconButton::new("unpin tab", IconName::Pin)
-                        .shape(IconButtonShape::Square)
-                        .icon_color(Color::Muted)
-                        .size(ButtonSize::None)
-                        .icon_size(IconSize::Small)
-                        .on_click(cx.listener(move |pane, _, window, cx| {
-                            pane.unpin_tab_at(ix, window, cx);
-                        }))
+                    Some(
+                        IconButton::new("unpin tab", IconName::Pin)
+                            .shape(IconButtonShape::Square)
+                            .icon_color(Color::Muted)
+                            .size(ButtonSize::None)
+                            .icon_size(IconSize::Custom(rems_from_px(11.)))
+                            .on_click(cx.listener(move |pane, _, window, cx| {
+                                pane.unpin_tab_at(ix, window, cx);
+                            })),
+                    )
                 } else {
                     end_slot_action = &CloseActiveItem {
                         save_intent: None,
@@ -3003,37 +3008,65 @@ impl Pane {
                     };
                     end_slot_tooltip_text = "Close Tab";
                     match show_close_button {
-                        ShowCloseButton::Always => IconButton::new("close tab", IconName::Close),
-                        ShowCloseButton::Hover => {
-                            IconButton::new("close tab", IconName::Close).visible_on_hover("")
+                        ShowCloseButton::Hidden => None,
+                        ShowCloseButton::Always => {
+                            Some(IconButton::new("close tab", IconName::Close))
                         }
-                        ShowCloseButton::Hidden => return this,
+                        ShowCloseButton::Hover => {
+                            Some(IconButton::new("close tab", IconName::Close).visible_on_hover(""))
+                        }
                     }
-                    .shape(IconButtonShape::Square)
-                    .icon_color(Color::Muted)
-                    .size(ButtonSize::None)
-                    .icon_size(IconSize::Small)
-                    .on_click(cx.listener(move |pane, _, window, cx| {
-                        pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
-                            .detach_and_log_err(cx);
-                    }))
-                }
-                .map(|this| {
-                    if is_active {
-                        let focus_handle = focus_handle.clone();
-                        this.tooltip(move |window, cx| {
-                            Tooltip::for_action_in(
-                                end_slot_tooltip_text,
-                                end_slot_action,
-                                &window.focused(cx).unwrap_or_else(|| focus_handle.clone()),
-                                cx,
-                            )
-                        })
-                    } else {
-                        this.tooltip(Tooltip::text(end_slot_tooltip_text))
-                    }
+                    .map(|button| {
+                        button
+                            .icon_color(Color::Muted)
+                            .size(ButtonSize::None)
+                            .icon_size(IconSize::Small)
+                            .on_click(cx.listener(move |pane, _, window, cx| {
+                                pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
+                                    .detach_and_log_err(cx);
+                            }))
+                    })
+                };
+
+                let button = button.map(|button| {
+                    button.map(|button| {
+                        if is_active {
+                            let focus_handle = focus_handle.clone();
+                            button.tooltip(move |window, cx| {
+                                Tooltip::for_action_in(
+                                    end_slot_tooltip_text,
+                                    end_slot_action,
+                                    &window.focused(cx).unwrap_or_else(|| focus_handle.clone()),
+                                    cx,
+                                )
+                            })
+                        } else {
+                            button.tooltip(Tooltip::text(end_slot_tooltip_text))
+                        }
+                    })
                 });
-                this.end_slot(end_slot)
+
+                // Show the dirty indicator in the close button's place when no
+                // button is shown, or beneath it when it only appears on hover.
+                let hover_only =
+                    !is_pinned && matches!(show_close_button, ShowCloseButton::Hover);
+                match (button, indicator) {
+                    (Some(button), Some(indicator)) if hover_only => this.end_slot(
+                        h_flex().relative().child(button).child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .group_hover("", |this| this.invisible())
+                                .child(indicator),
+                        ),
+                    ),
+                    (Some(button), _) => this.end_slot(button),
+                    (None, Some(indicator)) => this.end_slot(indicator),
+                    (None, None) => this,
+                }
             })
             .child(
                 h_flex()

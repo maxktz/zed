@@ -5,9 +5,6 @@ use smallvec::SmallVec;
 
 use crate::prelude::*;
 
-const START_TAB_SLOT_SIZE: Pixels = px(12.);
-const END_TAB_SLOT_SIZE: Pixels = px(14.);
-
 /// The position of a [`Tab`] within a list of tabs.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum TabPosition {
@@ -77,11 +74,11 @@ impl Tab {
     }
 
     pub fn content_height(cx: &App) -> Pixels {
-        DynamicSpacing::Base32.px(cx) - px(1.)
+        DynamicSpacing::Base32.px(cx) - px(3.)
     }
 
     pub fn container_height(cx: &App) -> Pixels {
-        DynamicSpacing::Base32.px(cx)
+        DynamicSpacing::Base32.px(cx) - px(2.)
     }
 }
 
@@ -124,21 +121,12 @@ impl RenderOnce for Tab {
             ),
         };
 
-        let (start_slot, end_slot) = {
-            let start_slot = h_flex()
-                .size(START_TAB_SLOT_SIZE)
-                .justify_center()
-                .children(self.start_slot);
-
-            let end_slot = h_flex()
-                .size(END_TAB_SLOT_SIZE)
-                .justify_center()
-                .children(self.end_slot);
-
-            match self.close_side {
-                TabCloseSide::End => (start_slot, end_slot),
-                TabCloseSide::Start => (end_slot, start_slot),
-            }
+        // Slots are rendered as plain flex children rather than fixed-size
+        // boxes, so an absent slot reserves no space and the row's gap/padding
+        // define the spacing between the icon, title and close button.
+        let (start_slot, end_slot) = match self.close_side {
+            TabCloseSide::End => (self.start_slot, self.end_slot),
+            TabCloseSide::Start => (self.end_slot, self.start_slot),
         };
 
         self.div
@@ -170,12 +158,13 @@ impl RenderOnce for Tab {
                     .group("")
                     .relative()
                     .h(Tab::content_height(cx))
-                    .px(DynamicSpacing::Base04.px(cx))
-                    .gap(DynamicSpacing::Base04.rems(cx))
+                    .pl(px(12.))
+                    .pr(px(6.))
+                    .gap(DynamicSpacing::Base02.rems(cx))
                     .text_color(text_color)
-                    .child(start_slot)
+                    .children(start_slot)
                     .children(self.children)
-                    .child(end_slot),
+                    .children(end_slot),
             )
     }
 }
