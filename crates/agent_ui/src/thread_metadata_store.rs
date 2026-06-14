@@ -452,8 +452,7 @@ impl From<&ThreadMetadata> for acp_thread::AgentSessionInfo {
     }
 }
 
-/// Record of a git worktree that was archived (deleted from disk) when its
-/// last thread was archived.
+/// Record of a git worktree that was archived and deleted from disk.
 pub struct ArchivedGitWorktree {
     /// Auto-incrementing primary key.
     pub id: i64,

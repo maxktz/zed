@@ -1804,44 +1804,24 @@ impl AgentPanel {
 
         self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::Thread, cx);
 
-        // If the user is viewing a *parked* draft and the ephemeral
-        // new-draft slot is occupied, pressing `+` should just focus the
-        // ephemeral draft — not park it and create yet another empty one.
-        // This matches the mental model of `+` as "go to my new-thread
-        // slot". The parked draft will be put back into `retained_threads`
-        // by `set_base_view`'s `retain_running_thread` call.
-        if let Some(draft) = self.draft_thread.clone()
-            && self.active_thread_is_draft(cx)
-            && !self.active_view_is_new_draft(cx)
-            && *draft.read(cx).agent_key() == self.selected_agent
-        {
-            self.set_base_view(
-                BaseView::AgentThread {
-                    conversation_view: draft,
-                },
-                focus,
-                window,
-                cx,
-            );
+        self.activate_draft_internal(false, focus, source, window, cx);
+    }
+
+    fn activate_new_thread_for_agent(
+        &mut self,
+        agent: Agent,
+        focus: bool,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.has_open_project(cx) {
             return;
         }
 
-        if let Some(draft) = self.draft_thread.clone() {
-            if self.draft_has_content(&draft, cx) {
-                let draft_id = draft.read(cx).thread_id;
-                self.draft_thread = None;
-                self._draft_editor_observation = None;
-                self.retained_threads.insert(draft_id, draft);
-            } else if *draft.read(cx).agent_key() != self.selected_agent {
-                let old_draft_id = draft.read(cx).thread_id;
-                ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                    store.delete(old_draft_id, cx);
-                });
-                self.draft_thread = None;
-                self._draft_editor_observation = None;
-            }
-        }
-        self.activate_draft(focus, source, window, cx);
+        self.selected_agent = agent;
+        self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::Thread, cx);
+        self.activate_draft_internal(true, focus, source, window, cx);
     }
 
     fn draft_has_content(&self, draft: &Entity<ConversationView>, cx: &App) -> bool {
@@ -1942,8 +1922,13 @@ impl AgentPanel {
             return;
         }
 
-        self.selected_agent = action.agent.clone().into();
-        self.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
+        self.activate_new_thread_for_agent(
+            action.agent.clone().into(),
+            true,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
     }
 
     pub fn new_terminal(
@@ -2270,15 +2255,6 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         self.close_terminal_internal(terminal_id, true, None, window, cx);
-    }
-
-    pub fn close_terminal_without_activating_draft(
-        &mut self,
-        terminal_id: TerminalId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.close_terminal_internal(terminal_id, false, None, window, cx);
     }
 
     fn close_terminal_internal(
@@ -2823,11 +2799,23 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.activate_draft_internal(false, focus, source, window, cx);
+    }
+
+    fn activate_draft_internal(
+        &mut self,
+        retarget_selected_agent: bool,
+        focus: bool,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.has_open_project(cx) {
             return;
         }
 
-        let draft = self.ensure_draft(source, window, cx);
+        let (draft, replaced_draft_id) =
+            self.ensure_draft(retarget_selected_agent, source, window, cx);
         if let BaseView::AgentThread { conversation_view } = &self.base_view {
             if conversation_view.entity_id() == draft.entity_id() {
                 // If we're already viewing the draft as the base view but an
@@ -2844,6 +2832,9 @@ impl AgentPanel {
                 return;
             }
         }
+        if replaced_draft_id.is_some_and(|thread_id| self.active_thread_id(cx) == Some(thread_id)) {
+            self.base_view = BaseView::Uninitialized;
+        }
         self.set_base_view(
             BaseView::AgentThread {
                 conversation_view: draft,
@@ -2852,52 +2843,53 @@ impl AgentPanel {
             window,
             cx,
         );
+        if let Some(replaced_draft_id) = replaced_draft_id {
+            self.retained_threads.remove(&replaced_draft_id);
+        }
     }
 
     fn ensure_draft(
         &mut self,
+        retarget_selected_agent: bool,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Entity<ConversationView> {
+    ) -> (Entity<ConversationView>, Option<ThreadId>) {
         let desired_agent = self.selected_agent(cx);
+        let mut replaced_draft_id = None;
+        let mut initial_content = None;
         if let Some(draft) = &self.draft_thread {
             let draft_entity = draft.entity_id();
             let agent_matches = *draft.read(cx).agent_key() == desired_agent;
-            let has_editor_content = draft.read(cx).root_thread_view().is_some_and(|tv| {
-                !tv.read(cx)
-                    .message_editor
-                    .read(cx)
-                    .text(cx)
-                    .trim()
-                    .is_empty()
-            });
-            // Only retarget the empty draft when the user is actively
-            // viewing it — that's the case where switching agents in the
-            // toolbar should replace the draft with one bound to the
-            // newly-selected agent. When the draft is parked in its slot
-            // while the user is viewing a real thread, `selected_agent`
-            // reflects that real thread's agent and must not be allowed
-            // to silently rebuild the draft.
             let draft_is_active = matches!(
                 &self.base_view,
                 BaseView::AgentThread { conversation_view }
                     if conversation_view.entity_id() == draft_entity
             );
 
-            if agent_matches || has_editor_content || !draft_is_active {
-                return draft.clone();
+            if agent_matches
+                || (!retarget_selected_agent
+                    && (!draft_is_active || self.draft_has_content(draft, cx)))
+            {
+                return (draft.clone(), None);
             }
 
-            // Clean up the old empty draft's metadata so it doesn't
-            // linger as a ghost entry in the sidebar.
             let old_draft_id = draft.read(cx).thread_id;
+            initial_content =
+                Self::initial_content_for_conversation_view(draft, cx).or_else(|| {
+                    crate::draft_prompt_store::read(old_draft_id, cx)
+                        .filter(|blocks| !blocks.is_empty())
+                        .map(|blocks| AgentInitialContent::ContentBlock {
+                            blocks,
+                            auto_submit: false,
+                        })
+                });
             ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.delete(old_draft_id, cx);
             });
-
             self.draft_thread = None;
             self._draft_editor_observation = None;
+            replaced_draft_id = Some(old_draft_id);
         }
 
         let thread = self.create_agent_thread_with_server(
@@ -2906,7 +2898,7 @@ impl AgentPanel {
             None,
             None,
             None,
-            None,
+            initial_content,
             None,
             source,
             window,
@@ -2915,7 +2907,7 @@ impl AgentPanel {
 
         self.draft_thread = Some(thread.conversation_view.clone());
         self.observe_draft_editor(&thread.conversation_view, cx);
-        thread.conversation_view
+        (thread.conversation_view, replaced_draft_id)
     }
 
     fn observe_draft_editor(
@@ -3163,57 +3155,6 @@ impl AgentPanel {
                 Some(conversation_view.read(cx).thread_id)
             }
             _ => None,
-        }
-    }
-
-    /// Drops a thread — retained or the active ephemeral draft — from
-    /// the panel and deletes its metadata row. Used by the sidebar when
-    /// the user dismisses a parked draft.
-    pub fn remove_thread(&mut self, id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
-        self.remove_thread_internal(id, true, window, cx);
-    }
-
-    pub fn remove_thread_without_activating_draft(
-        &mut self,
-        id: ThreadId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.remove_thread_internal(id, false, window, cx);
-    }
-
-    fn remove_thread_internal(
-        &mut self,
-        id: ThreadId,
-        activate_draft_after_remove: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.retained_threads.remove(&id);
-        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-            store.delete(id, cx);
-        });
-
-        if self
-            .draft_thread
-            .as_ref()
-            .is_some_and(|d| d.read(cx).thread_id == id)
-        {
-            self.draft_thread = None;
-            self._draft_editor_observation = None;
-        }
-
-        if self.active_thread_id(cx) == Some(id) {
-            self.clear_overlay_state();
-            if activate_draft_after_remove {
-                self.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
-            } else {
-                self.base_view = BaseView::Uninitialized;
-                self.refresh_base_view_subscriptions(window, cx);
-            }
-            self.serialize(cx);
-            cx.emit(AgentPanelEvent::ActiveViewChanged);
-            cx.notify();
         }
     }
 
@@ -4101,13 +4042,6 @@ impl AgentPanel {
             .as_ref()
             .is_some_and(|d| d.entity_id() == conversation_view.entity_id())
         {
-            if self.draft_has_content(&conversation_view, cx) {
-                let thread_id = conversation_view.read(cx).thread_id;
-                self.draft_thread = None;
-                self._draft_editor_observation = None;
-                self.retained_threads.insert(thread_id, conversation_view);
-                self.cleanup_retained_threads(cx);
-            }
             return;
         }
 
@@ -5215,7 +5149,15 @@ impl AgentPanel {
     }
 
     fn active_initial_content(&self, cx: &App) -> Option<AgentInitialContent> {
-        let thread_view = self.active_thread_view(cx)?;
+        let conversation_view = self.active_conversation_view()?;
+        Self::initial_content_for_conversation_view(conversation_view, cx)
+    }
+
+    fn initial_content_for_conversation_view(
+        conversation_view: &Entity<ConversationView>,
+        cx: &App,
+    ) -> Option<AgentInitialContent> {
+        let thread_view = conversation_view.read(cx).root_thread_view()?;
         let thread_view = thread_view.read(cx);
         let saved = thread_view
             .thread
@@ -5817,8 +5759,8 @@ impl AgentPanel {
                                                     workspace.panel::<AgentPanel>(cx)
                                                 {
                                                     panel.update(cx, |panel, cx| {
-                                                        panel.selected_agent = Agent::NativeAgent;
-                                                        panel.activate_new_thread(
+                                                        panel.activate_new_thread_for_agent(
+                                                            Agent::NativeAgent,
                                                             true,
                                                             AgentThreadSource::AgentPanel,
                                                             window,
