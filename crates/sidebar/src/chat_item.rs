@@ -5,8 +5,8 @@ use gpui::{
     Pixels, RenderOnce, Window, prelude::*, pulsating_between, px,
 };
 use ui::{
-    AgentThreadStatus, Color, CommonAnimationExt, HighlightedLabel, Icon, IconName, IconSize, Label,
-    LabelSize, SharedString, Tab, prelude::*,
+    AgentThreadStatus, Color, CommonAnimationExt, HighlightedLabel, Icon, IconName, IconSize,
+    Label, LabelSize, SharedString, Tab, prelude::*,
 };
 
 /// A single, compact row in the agent sidebar's main thread list.
@@ -14,16 +14,12 @@ use ui::{
 /// Deliberately minimal compared to [`ui::ThreadItem`] (used by the history /
 /// archive view): one line, no worktree chips, diff stats, or project footer.
 /// The leading slot only renders a glyph while the thread is in an active
-/// state (running / waiting / error / just-finished) or for an explicit
-/// `idle_icon` (drafts); otherwise the slot is kept empty but sized so titles
-/// never shift horizontally as state changes.
+/// state (running / waiting / error / just-finished); otherwise the slot is kept
+/// empty but sized so titles never shift horizontally as state changes.
 #[derive(IntoElement)]
 pub struct ChatItem {
     id: ElementId,
     title: SharedString,
-    /// Glyph shown in the idle state. `None` keeps the leading slot empty.
-    idle_icon: Option<IconName>,
-    idle_icon_color: Option<Color>,
     status: AgentThreadStatus,
     notified: bool,
     title_color: Color,
@@ -47,8 +43,6 @@ impl ChatItem {
         Self {
             id: id.into(),
             title: title.into(),
-            idle_icon: None,
-            idle_icon_color: None,
             status: AgentThreadStatus::default(),
             notified: false,
             title_color: Color::Default,
@@ -64,16 +58,6 @@ impl ChatItem {
             on_click: None,
             on_hover: Box::new(|_, _, _| {}),
         }
-    }
-
-    pub fn idle_icon(mut self, icon: Option<IconName>) -> Self {
-        self.idle_icon = icon;
-        self
-    }
-
-    pub fn idle_icon_color(mut self, color: Color) -> Self {
-        self.idle_icon_color = Some(color);
-        self
     }
 
     pub fn status(mut self, status: AgentThreadStatus) -> Self {
@@ -186,12 +170,6 @@ impl RenderOnce for ChatItem {
                     .size(IconSize::Small)
                     .color(Color::Accent),
             )
-        } else if let Some(idle_icon) = self.idle_icon {
-            icon_slot.child(
-                Icon::new(idle_icon)
-                    .size(IconSize::Small)
-                    .color(self.idle_icon_color.unwrap_or(Color::Muted)),
-            )
         } else {
             icon_slot
         };
@@ -251,7 +229,9 @@ impl RenderOnce for ChatItem {
             .border_1()
             .border_color(gpui::transparent_black())
             .when(self.selected, |this| this.bg(colors.element_active))
-            .when(self.focused, |this| this.border_color(colors.border_focused))
+            .when(self.focused, |this| {
+                this.border_color(colors.border_focused)
+            })
             .hover(|this| this.bg(hover_color))
             .when_some(self.on_click, |this, on_click| this.on_click(on_click))
             .on_hover(self.on_hover)
