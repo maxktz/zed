@@ -1,7 +1,7 @@
 mod chat_item;
 mod thread_switcher;
 
-use chat_item::ChatItem;
+use chat_item::{CHAT_ITEM_HEIGHT, ChatItem};
 
 use acp_thread::ThreadStatus;
 use action_log::DiffStats;
@@ -2215,11 +2215,11 @@ impl Sidebar {
         div().when(gap_above, |this| this.pt(px(4.))).child(
             h_flex()
                 .id(SharedString::from(format!("worktree-header-{ix}")))
-                .h(px(26.))
+                .h(CHAT_ITEM_HEIGHT)
                 .w_full()
                 .px_1p5()
                 // Indent inside the padding so the bg stays full-width.
-                .pl(px(19.))
+                .pl(px(17.))
                 .gap_1()
                 .border_1()
                 .map(|this| {
@@ -2235,7 +2235,7 @@ impl Sidebar {
                 .child(
                     h_flex().size_4().flex_none().justify_center().child(
                         Icon::new(IconName::GitWorktree)
-                            .size(IconSize::XSmall)
+                            .size(IconSize::Small)
                             .color(if is_active {
                                 Color::Muted
                             } else {
@@ -2332,7 +2332,7 @@ impl Sidebar {
             .group(&group_name)
             .when(!has_filter, |this| this.cursor_pointer())
             .relative()
-            .h(Tab::content_height(cx))
+            .h(CHAT_ITEM_HEIGHT)
             .w_full()
             .pr_1p5()
             .pl_2()
@@ -5362,7 +5362,7 @@ impl Sidebar {
                 .contains(&thread.metadata.thread_id);
 
         let thread_item = ChatItem::new(id, title.clone())
-            .indent(px(18.))
+            .indent(px(37.))
             // Title is muted unless this is the active thread.
             .title_color(if is_selected {
                 Color::Default
@@ -5654,7 +5654,7 @@ impl Sidebar {
             };
 
         ChatItem::new(id, title)
-            .indent(px(18.))
+            .indent(px(37.))
             // Title is muted unless this is the active terminal.
             .title_color(if is_active {
                 Color::Default

@@ -2,12 +2,15 @@ use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt, AnyElement, App, ClickEvent, ElementId, IntoElement, MouseButton,
-    Pixels, RenderOnce, Window, prelude::*, pulsating_between, px,
+    Pixels, RenderOnce, Window, prelude::*, pulsating_between, px, rems,
 };
 use ui::{
     AgentThreadStatus, Color, CommonAnimationExt, HighlightedLabel, Icon, IconName, IconSize,
-    Label, LabelSize, SharedString, Tab, prelude::*,
+    Label, LabelSize, SharedString, prelude::*,
 };
+
+pub const CHAT_ITEM_HEIGHT: Pixels = px(28.);
+const CHAT_ITEM_STATUS_ICON_SLOT_SIZE: Pixels = px(12.);
 
 /// A single, compact row in the agent sidebar's main thread list.
 ///
@@ -142,36 +145,37 @@ impl RenderOnce for ChatItem {
             .element_active
             .blend(colors.element_background.opacity(0.2));
 
-        // The leading slot is always 16px wide so titles stay aligned whether
-        // or not a glyph is present.
-        let icon_slot = h_flex().size_4().flex_none().justify_center();
-        let icon_slot = if self.status == AgentThreadStatus::Running {
-            icon_slot.child(
+        let icon_slot: Option<AnyElement> = if self.status == AgentThreadStatus::Running {
+            Some(
                 Icon::new(IconName::LoadCircle)
-                    .size(IconSize::Small)
+                    .size(IconSize::XSmall)
                     .color(Color::Muted)
-                    .with_rotate_animation(2),
+                    .with_rotate_animation(2)
+                    .into_any_element(),
             )
         } else if self.status == AgentThreadStatus::Error {
-            icon_slot.child(
+            Some(
                 Icon::new(IconName::Close)
-                    .size(IconSize::Small)
-                    .color(Color::Error),
+                    .size(IconSize::XSmall)
+                    .color(Color::Error)
+                    .into_any_element(),
             )
         } else if self.status == AgentThreadStatus::WaitingForConfirmation {
-            icon_slot.child(
+            Some(
                 Icon::new(IconName::Warning)
                     .size(IconSize::XSmall)
-                    .color(Color::Warning),
+                    .color(Color::Warning)
+                    .into_any_element(),
             )
         } else if self.notified {
-            icon_slot.child(
+            Some(
                 Icon::new(IconName::Circle)
-                    .size(IconSize::Small)
-                    .color(Color::Accent),
+                    .size(IconSize::XSmall)
+                    .color(Color::Accent)
+                    .into_any_element(),
             )
         } else {
-            icon_slot
+            None
         };
 
         let title_label = if let Some(title_slot) = self.title_slot {
@@ -207,7 +211,7 @@ impl RenderOnce for ChatItem {
         } else {
             Some(
                 Label::new(self.timestamp)
-                    .size(LabelSize::Small)
+                    .size(LabelSize::Custom(rems(0.6875)))
                     .color(Color::Disabled)
                     .into_any_element(),
             )
@@ -219,7 +223,7 @@ impl RenderOnce for ChatItem {
             .relative()
             .flex_shrink_0()
             .w_full()
-            .h(Tab::content_height(cx))
+            .h(CHAT_ITEM_HEIGHT)
             .px_1p5()
             .pr_2()
             .gap_2()
@@ -240,7 +244,15 @@ impl RenderOnce for ChatItem {
                     .min_w_0()
                     .flex_1()
                     .gap_1()
-                    .child(icon_slot)
+                    .when_some(icon_slot, |this, icon| {
+                        this.child(
+                            h_flex()
+                                .size(CHAT_ITEM_STATUS_ICON_SLOT_SIZE)
+                                .flex_none()
+                                .justify_center()
+                                .child(icon),
+                        )
+                    })
                     .child(title_label),
             )
             .when_some(trailing, |this, trailing| {
