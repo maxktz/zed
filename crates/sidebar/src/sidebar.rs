@@ -310,11 +310,23 @@ struct TerminalEntry {
     highlight_positions: Vec<usize>,
 }
 
+#[derive(Clone, Copy)]
+enum WorkspaceHeaderLabelSource {
+    Branch,
+    Folder,
+}
+
+struct WorkspaceHeaderLabel {
+    text: SharedString,
+    source: WorkspaceHeaderLabelSource,
+}
+
 #[derive(Clone)]
 struct LoadedWorkspaceHeader {
     path_list: PathList,
     project_group_key: ProjectGroupKey,
     label: SharedString,
+    label_source: WorkspaceHeaderLabelSource,
     highlight_positions: Vec<usize>,
     workspace: Option<Entity<Workspace>>,
     is_active: bool,
@@ -412,6 +424,7 @@ enum ListEntry {
         project_group_key: ProjectGroupKey,
         path_list: PathList,
         label: SharedString,
+        label_source: WorkspaceHeaderLabelSource,
         highlight_positions: Vec<usize>,
         workspace: Option<Entity<Workspace>>,
         is_active: bool,
@@ -685,27 +698,69 @@ fn branch_label_for_path_list(
     (!labels.is_empty()).then(|| labels.join(", ").into())
 }
 
-fn path_list_folder_label(path_list: &PathList) -> SharedString {
+fn strip_project_name_prefix(folder_name: String, project_group_key: &ProjectGroupKey) -> String {
+    for project_path in project_group_key.path_list().ordered_paths() {
+        let Some(project_name) = project_path.file_name() else {
+            continue;
+        };
+        let project_name = project_name.to_string_lossy();
+        if project_name.is_empty() {
+            continue;
+        }
+
+        let prefix = format!("{project_name}.");
+        if let Some(stripped) = folder_name.strip_prefix(&prefix)
+            && !stripped.is_empty()
+        {
+            return stripped.to_string();
+        }
+    }
+
+    folder_name
+}
+
+fn path_list_folder_label(
+    path_list: &PathList,
+    project_group_key: &ProjectGroupKey,
+) -> SharedString {
     path_list
         .ordered_paths()
         .map(|root_path| {
-            root_path
+            let folder_name = root_path
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_default()
+                .unwrap_or_default();
+            strip_project_name_prefix(folder_name, project_group_key)
         })
         .join(", ")
         .into()
 }
 
-fn workspace_slot_label_text(
+fn workspace_slot_label(
     path_list: &PathList,
+    project_group_key: &ProjectGroupKey,
     branch_by_path: &HashMap<PathBuf, SharedString>,
     cached_label: Option<&str>,
-) -> SharedString {
-    branch_label_for_path_list(path_list, branch_by_path)
-        .or_else(|| cached_label.map(SharedString::from))
-        .unwrap_or_else(|| path_list_folder_label(path_list))
+    allow_cached_label: bool,
+) -> WorkspaceHeaderLabel {
+    if let Some(label) = branch_label_for_path_list(path_list, branch_by_path) {
+        return WorkspaceHeaderLabel {
+            text: label,
+            source: WorkspaceHeaderLabelSource::Branch,
+        };
+    }
+
+    if allow_cached_label && let Some(label) = cached_label {
+        return WorkspaceHeaderLabel {
+            text: SharedString::from(label),
+            source: WorkspaceHeaderLabelSource::Branch,
+        };
+    }
+
+    WorkspaceHeaderLabel {
+        text: path_list_folder_label(path_list, project_group_key),
+        source: WorkspaceHeaderLabelSource::Folder,
+    }
 }
 
 fn path_list_sort_key(path_list: &PathList) -> String {
@@ -1766,23 +1821,29 @@ impl Sidebar {
                         return;
                     }
 
-                    let label =
-                        workspace_slot_label_text(&path_list, &branch_by_path, cached_label);
-                    let highlight_positions = if query.is_empty() {
-                        Vec::new()
-                    } else {
-                        fuzzy_match_positions(&query, &label).unwrap_or_default()
-                    };
                     let is_loading = mw.is_workspace_slot_opening(&slot_id)
                         || workspace.as_ref().is_some_and(|workspace| {
                             workspace_slot_metadata_loading(workspace, &branch_by_path, cx)
                         });
+                    let label = workspace_slot_label(
+                        &path_list,
+                        group_key,
+                        &branch_by_path,
+                        cached_label,
+                        workspace.is_none() || is_loading,
+                    );
+                    let highlight_positions = if query.is_empty() {
+                        Vec::new()
+                    } else {
+                        fuzzy_match_positions(&query, &label.text).unwrap_or_default()
+                    };
 
                     loaded_workspace_headers.push(LoadedWorkspaceHeader {
                         project_group_key: group_key.clone(),
                         is_main: path_list == *group_key.path_list(),
                         path_list,
-                        label,
+                        label: label.text,
+                        label_source: label.source,
                         highlight_positions,
                         is_active: workspace
                             .as_ref()
@@ -2384,6 +2445,7 @@ impl Sidebar {
                 project_group_key,
                 path_list,
                 label,
+                label_source,
                 highlight_positions,
                 workspace,
                 is_active,
@@ -2395,6 +2457,7 @@ impl Sidebar {
                     project_group_key,
                     path_list,
                     label,
+                    *label_source,
                     highlight_positions,
                     workspace.as_ref(),
                     *is_active,
@@ -2452,6 +2515,7 @@ impl Sidebar {
         project_group_key: &ProjectGroupKey,
         path_list: &PathList,
         label: &SharedString,
+        label_source: WorkspaceHeaderLabelSource,
         highlight_positions: &[usize],
         workspace: Option<&Entity<Workspace>>,
         is_active: bool,
@@ -2523,6 +2587,10 @@ impl Sidebar {
         let project_group_key_for_click = project_group_key.clone();
         let path_list_for_click = path_list.clone();
         let workspace_for_click = workspace.clone();
+        let label_icon = match label_source {
+            WorkspaceHeaderLabelSource::Branch => IconName::GitBranch,
+            WorkspaceHeaderLabelSource::Folder => IconName::GitWorktree,
+        };
 
         div().child(
             h_flex()
@@ -2558,7 +2626,7 @@ impl Sidebar {
                                     .with_rotate_animation(2)
                                     .into_any_element()
                             } else {
-                                Icon::new(IconName::GitWorktree)
+                                Icon::new(label_icon)
                                     .size(IconSize::Small)
                                     .color(if is_active {
                                         Color::Muted
@@ -5132,6 +5200,7 @@ impl Sidebar {
             project_group_key: ProjectGroupKey,
             path_list: PathList,
             label: SharedString,
+            label_source: WorkspaceHeaderLabelSource,
             highlight_positions: Vec<usize>,
             workspace: Option<Entity<Workspace>>,
             is_active: bool,
@@ -5202,6 +5271,7 @@ impl Sidebar {
                 sort_key: path_list_sort_key(&loaded_workspace.path_list),
                 path_list: loaded_workspace.path_list,
                 label: loaded_workspace.label,
+                label_source: loaded_workspace.label_source,
                 highlight_positions: loaded_workspace.highlight_positions,
                 workspace: loaded_workspace.workspace,
                 is_active: loaded_workspace.is_active,
@@ -5212,104 +5282,119 @@ impl Sidebar {
         }
 
         for entry in row_entries {
-            let (key, project_group_key, path_list, label, workspace, is_active, is_main, sort_key) =
-                match &entry {
-                    ListEntry::Thread(thread) => match &thread.workspace {
-                        ThreadEntryWorkspace::Open(workspace) => {
-                            let path_list = workspace_path_list(workspace, cx);
-                            let is_main = path_list == *main_worktree_paths;
-                            let sort_key = path_list_sort_key(&path_list);
-                            (
-                                WorkspaceBucketKey::Path(path_list.clone()),
-                                workspace.read(cx).project_group_key(cx),
-                                path_list,
-                                workspace_menu_worktree_label_text(workspace, cx),
-                                Some(workspace.clone()),
-                                false,
-                                is_main,
-                                sort_key,
-                            )
-                        }
-                        ThreadEntryWorkspace::Closed {
-                            folder_paths,
-                            project_group_key,
-                        } => {
-                            let (key, label, is_main) = closed_worktree_group(&entry);
-                            if folder_paths.paths().is_empty() {
-                                (
-                                    WorkspaceBucketKey::Closed(key.clone()),
-                                    ProjectGroupKey::default(),
-                                    PathList::default(),
-                                    label,
-                                    None,
-                                    false,
-                                    is_main,
-                                    key,
-                                )
-                            } else {
-                                (
-                                    WorkspaceBucketKey::Path(folder_paths.clone()),
-                                    project_group_key.clone(),
-                                    folder_paths.clone(),
-                                    label,
-                                    None,
-                                    false,
-                                    folder_paths == main_worktree_paths,
-                                    path_list_sort_key(folder_paths),
-                                )
-                            }
-                        }
-                    },
-                    ListEntry::Terminal(terminal) => match &terminal.workspace {
-                        ThreadEntryWorkspace::Open(workspace) => {
-                            let path_list = workspace_path_list(workspace, cx);
-                            let is_main = path_list == *main_worktree_paths;
-                            let sort_key = path_list_sort_key(&path_list);
-                            (
-                                WorkspaceBucketKey::Path(path_list.clone()),
-                                workspace.read(cx).project_group_key(cx),
-                                path_list,
-                                workspace_menu_worktree_label_text(workspace, cx),
-                                Some(workspace.clone()),
-                                false,
-                                is_main,
-                                sort_key,
-                            )
-                        }
-                        ThreadEntryWorkspace::Closed {
-                            folder_paths,
-                            project_group_key,
-                        } => {
-                            let (key, label, is_main) = closed_worktree_group(&entry);
-                            if folder_paths.paths().is_empty() {
-                                (
-                                    WorkspaceBucketKey::Closed(key.clone()),
-                                    ProjectGroupKey::default(),
-                                    PathList::default(),
-                                    label,
-                                    None,
-                                    false,
-                                    is_main,
-                                    key,
-                                )
-                            } else {
-                                (
-                                    WorkspaceBucketKey::Path(folder_paths.clone()),
-                                    project_group_key.clone(),
-                                    folder_paths.clone(),
-                                    label,
-                                    None,
-                                    false,
-                                    folder_paths == main_worktree_paths,
-                                    path_list_sort_key(folder_paths),
-                                )
-                            }
-                        }
-                    },
-                    ListEntry::ProjectHeader { .. } | ListEntry::WorkspaceHeader { .. } => {
-                        unreachable!()
+            let (
+                key,
+                project_group_key,
+                path_list,
+                label,
+                label_source,
+                workspace,
+                is_active,
+                is_main,
+                sort_key,
+            ) = match &entry {
+                ListEntry::Thread(thread) => match &thread.workspace {
+                    ThreadEntryWorkspace::Open(workspace) => {
+                        let path_list = workspace_path_list(workspace, cx);
+                        let is_main = path_list == *main_worktree_paths;
+                        let sort_key = path_list_sort_key(&path_list);
+                        (
+                            WorkspaceBucketKey::Path(path_list.clone()),
+                            workspace.read(cx).project_group_key(cx),
+                            path_list,
+                            workspace_menu_worktree_label_text(workspace, cx),
+                            WorkspaceHeaderLabelSource::Folder,
+                            Some(workspace.clone()),
+                            false,
+                            is_main,
+                            sort_key,
+                        )
                     }
-                };
+                    ThreadEntryWorkspace::Closed {
+                        folder_paths,
+                        project_group_key,
+                    } => {
+                        let (key, label, is_main) = closed_worktree_group(&entry);
+                        if folder_paths.paths().is_empty() {
+                            (
+                                WorkspaceBucketKey::Closed(key.clone()),
+                                ProjectGroupKey::default(),
+                                PathList::default(),
+                                label,
+                                WorkspaceHeaderLabelSource::Folder,
+                                None,
+                                false,
+                                is_main,
+                                key,
+                            )
+                        } else {
+                            (
+                                WorkspaceBucketKey::Path(folder_paths.clone()),
+                                project_group_key.clone(),
+                                folder_paths.clone(),
+                                label,
+                                WorkspaceHeaderLabelSource::Folder,
+                                None,
+                                false,
+                                folder_paths == main_worktree_paths,
+                                path_list_sort_key(folder_paths),
+                            )
+                        }
+                    }
+                },
+                ListEntry::Terminal(terminal) => match &terminal.workspace {
+                    ThreadEntryWorkspace::Open(workspace) => {
+                        let path_list = workspace_path_list(workspace, cx);
+                        let is_main = path_list == *main_worktree_paths;
+                        let sort_key = path_list_sort_key(&path_list);
+                        (
+                            WorkspaceBucketKey::Path(path_list.clone()),
+                            workspace.read(cx).project_group_key(cx),
+                            path_list,
+                            workspace_menu_worktree_label_text(workspace, cx),
+                            WorkspaceHeaderLabelSource::Folder,
+                            Some(workspace.clone()),
+                            false,
+                            is_main,
+                            sort_key,
+                        )
+                    }
+                    ThreadEntryWorkspace::Closed {
+                        folder_paths,
+                        project_group_key,
+                    } => {
+                        let (key, label, is_main) = closed_worktree_group(&entry);
+                        if folder_paths.paths().is_empty() {
+                            (
+                                WorkspaceBucketKey::Closed(key.clone()),
+                                ProjectGroupKey::default(),
+                                PathList::default(),
+                                label,
+                                WorkspaceHeaderLabelSource::Folder,
+                                None,
+                                false,
+                                is_main,
+                                key,
+                            )
+                        } else {
+                            (
+                                WorkspaceBucketKey::Path(folder_paths.clone()),
+                                project_group_key.clone(),
+                                folder_paths.clone(),
+                                label,
+                                WorkspaceHeaderLabelSource::Folder,
+                                None,
+                                false,
+                                folder_paths == main_worktree_paths,
+                                path_list_sort_key(folder_paths),
+                            )
+                        }
+                    }
+                },
+                ListEntry::ProjectHeader { .. } | ListEntry::WorkspaceHeader { .. } => {
+                    unreachable!()
+                }
+            };
 
             let bucket_ix = if let Some(ix) = bucket_indices.get(&key).copied() {
                 ix
@@ -5320,6 +5405,7 @@ impl Sidebar {
                     project_group_key,
                     path_list,
                     label,
+                    label_source,
                     highlight_positions: Vec::new(),
                     workspace,
                     is_active,
@@ -5358,6 +5444,7 @@ impl Sidebar {
                 project_group_key: bucket.project_group_key,
                 path_list: bucket.path_list,
                 label: bucket.label,
+                label_source: bucket.label_source,
                 highlight_positions: bucket.highlight_positions,
                 workspace: bucket.workspace,
                 is_active: bucket.is_active,
@@ -6438,13 +6525,19 @@ impl Sidebar {
             return;
         }
 
-        let label = workspace_slot_label_text(&path_list, branch_by_path, cached_label);
+        let label = workspace_slot_label(
+            &path_list,
+            project_group_key,
+            branch_by_path,
+            cached_label,
+            workspace.is_none(),
+        );
         Self::ensure_workspace_shortcut_bucket(
             buckets,
             bucket_indices,
             project_group_key.clone(),
             path_list.clone(),
-            label,
+            label.text,
             workspace,
             path_list == *project_group_key.path_list(),
         );
@@ -6463,22 +6556,39 @@ impl Sidebar {
             | WorkspaceShortcutChat::Terminal { workspace, .. } => match workspace {
                 ThreadEntryWorkspace::Open(workspace) => {
                     let path_list = workspace_path_list(workspace, cx);
+                    let project_group_key = workspace.read(cx).project_group_key(cx);
+                    let label = workspace_slot_label(
+                        &path_list,
+                        &project_group_key,
+                        branch_by_path,
+                        None,
+                        false,
+                    );
                     (
-                        workspace.read(cx).project_group_key(cx),
+                        project_group_key,
                         path_list,
-                        workspace_menu_worktree_label_text(workspace, cx),
+                        label.text,
                         Some(workspace.clone()),
                     )
                 }
                 ThreadEntryWorkspace::Closed {
                     folder_paths,
                     project_group_key,
-                } => (
-                    project_group_key.clone(),
-                    folder_paths.clone(),
-                    workspace_slot_label_text(folder_paths, branch_by_path, None),
-                    None,
-                ),
+                } => {
+                    let label = workspace_slot_label(
+                        folder_paths,
+                        project_group_key,
+                        branch_by_path,
+                        None,
+                        false,
+                    );
+                    (
+                        project_group_key.clone(),
+                        folder_paths.clone(),
+                        label.text,
+                        None,
+                    )
+                }
             },
         };
 
