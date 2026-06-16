@@ -2,13 +2,15 @@ use anyhow::Result;
 use fs::Fs;
 
 use gpui::{
-    AnyView, App, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    ManagedView, MouseButton, Pixels, Render, Subscription, Task, TaskExt, Tiling, WeakEntity,
-    Window, WindowId, actions, deferred, px,
+    Action, AnyView, App, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, ManagedView, MouseButton, Pixels, Render, Subscription, Task, TaskExt, Tiling,
+    WeakEntity, Window, WindowId, actions, deferred, px,
 };
 pub use project::ProjectGroupKey;
 use project::{DisableAiSettings, Project};
 use remote::RemoteConnectionOptions;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use settings::Settings;
 pub use settings::SidebarSide;
 use std::cell::Cell;
@@ -57,6 +59,11 @@ actions!(
         MoveProjectToNewWindow,
     ]
 );
+
+/// Activates the workspace at the given zero-based sidebar index.
+#[derive(Clone, Deserialize, PartialEq, JsonSchema, Action)]
+#[action(namespace = multi_workspace)]
+pub struct ActivateWorkspace(pub usize);
 
 #[derive(Default)]
 pub struct SidebarRenderState {
@@ -145,6 +152,15 @@ pub trait Sidebar: Focusable + Render + EventEmitter<SidebarEvent> + Sized {
     /// Activates the next or previous thread in sidebar order.
     fn cycle_thread(&mut self, _forward: bool, _window: &mut Window, _cx: &mut Context<Self>) {}
 
+    /// Activates the workspace at the given zero-based sidebar index.
+    fn activate_workspace_at_index(
+        &mut self,
+        _index: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
     /// Return an opaque JSON blob of sidebar-specific state to persist.
     fn serialized_state(&self, _cx: &App) -> Option<String> {
         None
@@ -173,6 +189,7 @@ pub trait SidebarHandle: 'static + Send + Sync {
     fn focus_filter(&self, window: &mut Window, cx: &mut App);
     fn cycle_project(&self, forward: bool, window: &mut Window, cx: &mut App);
     fn cycle_thread(&self, forward: bool, window: &mut Window, cx: &mut App);
+    fn activate_workspace_at_index(&self, index: usize, window: &mut Window, cx: &mut App);
 
     fn is_threads_list_view_active(&self, cx: &App) -> bool;
 
@@ -254,6 +271,15 @@ impl<T: Sidebar> SidebarHandle for Entity<T> {
         window.defer(cx, move |window, cx| {
             entity.update(cx, |this, cx| {
                 this.cycle_thread(forward, window, cx);
+            });
+        });
+    }
+
+    fn activate_workspace_at_index(&self, index: usize, window: &mut Window, cx: &mut App) {
+        let entity = self.clone();
+        window.defer(cx, move |window, cx| {
+            entity.update(cx, |this, cx| {
+                this.activate_workspace_at_index(index, window, cx);
             });
         });
     }
@@ -2563,6 +2589,13 @@ impl Render for MultiWorkspace {
                             sidebar.cycle_thread(true, window, cx);
                         }
                     }))
+                    .on_action(cx.listener(
+                        |this: &mut Self, action: &ActivateWorkspace, window, cx| {
+                            if let Some(sidebar) = &this.sidebar {
+                                sidebar.activate_workspace_at_index(action.0, window, cx);
+                            }
+                        },
+                    ))
                     .on_action(
                         cx.listener(|this: &mut Self, _: &PreviousThread, window, cx| {
                             if let Some(sidebar) = &this.sidebar {

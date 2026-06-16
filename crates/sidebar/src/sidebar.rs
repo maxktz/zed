@@ -64,8 +64,8 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
 use util::path_list::PathList;
 use workspace::{
-    CloseWindow, FocusWorkspaceSidebar, MultiWorkspace, MultiWorkspaceEvent, NextProject,
-    NextThread, Open, OpenMode, PreviousProject, PreviousThread, ProjectGroupKey,
+    ActivateWorkspace, CloseWindow, FocusWorkspaceSidebar, MultiWorkspace, MultiWorkspaceEvent,
+    NextProject, NextThread, Open, OpenMode, PreviousProject, PreviousThread, ProjectGroupKey,
     Sidebar as WorkspaceSidebar, SidebarSide, Toast, ToggleWorkspaceSidebar, Workspace,
     WorkspaceSlotId, notifications::NotificationId, sidebar_side_context_menu,
 };
@@ -320,6 +320,62 @@ struct LoadedWorktreeHeader {
     is_active: bool,
     is_main: bool,
     is_loading: bool,
+}
+
+#[derive(Clone)]
+struct WorkspaceShortcutTarget {
+    project_group_key: ProjectGroupKey,
+    path_list: PathList,
+    workspace: Option<Entity<Workspace>>,
+    chats: Vec<WorkspaceShortcutChat>,
+}
+
+struct WorkspaceShortcutBucket {
+    project_group_key: ProjectGroupKey,
+    path_list: PathList,
+    label: SharedString,
+    workspace: Option<Entity<Workspace>>,
+    is_main: bool,
+    sort_key: String,
+    chats: Vec<WorkspaceShortcutChat>,
+}
+
+#[derive(Clone)]
+enum WorkspaceShortcutChat {
+    Thread {
+        metadata: ThreadMetadata,
+        workspace: ThreadEntryWorkspace,
+    },
+    Terminal {
+        metadata: TerminalThreadMetadata,
+        workspace: ThreadEntryWorkspace,
+    },
+}
+
+impl WorkspaceShortcutChat {
+    fn display_time(&self) -> DateTime<Utc> {
+        match self {
+            Self::Thread { metadata, .. } => Sidebar::thread_display_time(metadata),
+            Self::Terminal { metadata, .. } => metadata.display_time(),
+        }
+    }
+
+    fn matches_active_chat(
+        &self,
+        active_thread_id: Option<ThreadId>,
+        active_session_id: Option<&acp::SessionId>,
+        active_terminal_id: Option<TerminalId>,
+    ) -> bool {
+        match self {
+            Self::Thread { metadata, .. } => {
+                active_thread_id == Some(metadata.thread_id)
+                    || active_session_id
+                        .zip(metadata.session_id.as_ref())
+                        .is_some_and(|(active, metadata)| active == metadata)
+            }
+            Self::Terminal { metadata, .. } => active_terminal_id == Some(metadata.terminal_id),
+        }
+    }
 }
 
 impl ThreadEntry {
@@ -650,6 +706,14 @@ fn workspace_slot_label_text(
     branch_label_for_path_list(path_list, branch_by_path)
         .or_else(|| cached_label.map(SharedString::from))
         .unwrap_or_else(|| path_list_folder_label(path_list))
+}
+
+fn path_list_sort_key(path_list: &PathList) -> String {
+    path_list
+        .paths()
+        .iter()
+        .map(|path| path.to_string_lossy())
+        .join("\0")
 }
 
 fn workspace_slot_metadata_loading(
@@ -6337,6 +6401,509 @@ impl Sidebar {
             })
     }
 
+    fn ensure_workspace_shortcut_bucket(
+        buckets: &mut Vec<WorkspaceShortcutBucket>,
+        bucket_indices: &mut HashMap<PathList, usize>,
+        project_group_key: ProjectGroupKey,
+        path_list: PathList,
+        label: SharedString,
+        workspace: Option<Entity<Workspace>>,
+        is_main: bool,
+    ) -> Option<usize> {
+        if path_list.paths().is_empty() {
+            return None;
+        }
+
+        if let Some(ix) = bucket_indices.get(&path_list).copied() {
+            if buckets[ix].workspace.is_none() && workspace.is_some() {
+                buckets[ix].workspace = workspace;
+            }
+            return Some(ix);
+        }
+
+        let ix = buckets.len();
+        bucket_indices.insert(path_list.clone(), ix);
+        buckets.push(WorkspaceShortcutBucket {
+            project_group_key,
+            sort_key: path_list_sort_key(&path_list),
+            path_list,
+            label,
+            workspace,
+            is_main,
+            chats: Vec::new(),
+        });
+        Some(ix)
+    }
+
+    fn push_workspace_shortcut_bucket(
+        &self,
+        buckets: &mut Vec<WorkspaceShortcutBucket>,
+        bucket_indices: &mut HashMap<PathList, usize>,
+        project_group_key: &ProjectGroupKey,
+        path_list: PathList,
+        workspace: Option<Entity<Workspace>>,
+        cached_label: Option<&str>,
+        branch_by_path: &HashMap<PathBuf, SharedString>,
+    ) {
+        let slot_id = WorkspaceSlotId::new(project_group_key.clone(), path_list.clone());
+        if self.hidden_workspace_slots.contains(&slot_id) {
+            return;
+        }
+
+        let label = workspace_slot_label_text(&path_list, branch_by_path, cached_label);
+        Self::ensure_workspace_shortcut_bucket(
+            buckets,
+            bucket_indices,
+            project_group_key.clone(),
+            path_list.clone(),
+            label,
+            workspace,
+            path_list == *project_group_key.path_list(),
+        );
+    }
+
+    fn push_workspace_shortcut_chat(
+        buckets: &mut Vec<WorkspaceShortcutBucket>,
+        bucket_indices: &mut HashMap<PathList, usize>,
+        chat: WorkspaceShortcutChat,
+        branch_by_path: &HashMap<PathBuf, SharedString>,
+        main_worktree_paths: &PathList,
+        cx: &App,
+    ) {
+        let (project_group_key, path_list, label, workspace) = match &chat {
+            WorkspaceShortcutChat::Thread { workspace, .. }
+            | WorkspaceShortcutChat::Terminal { workspace, .. } => match workspace {
+                ThreadEntryWorkspace::Open(workspace) => {
+                    let path_list = workspace_path_list(workspace, cx);
+                    (
+                        workspace.read(cx).project_group_key(cx),
+                        path_list,
+                        workspace_menu_worktree_label_text(workspace, cx),
+                        Some(workspace.clone()),
+                    )
+                }
+                ThreadEntryWorkspace::Closed {
+                    folder_paths,
+                    project_group_key,
+                } => (
+                    project_group_key.clone(),
+                    folder_paths.clone(),
+                    workspace_slot_label_text(folder_paths, branch_by_path, None),
+                    None,
+                ),
+            },
+        };
+
+        let Some(ix) = Self::ensure_workspace_shortcut_bucket(
+            buckets,
+            bucket_indices,
+            project_group_key,
+            path_list.clone(),
+            label,
+            workspace,
+            path_list == *main_worktree_paths,
+        ) else {
+            return;
+        };
+
+        buckets[ix].chats.push(chat);
+    }
+
+    fn workspace_shortcut_targets(&self, cx: &App) -> Vec<WorkspaceShortcutTarget> {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return Vec::new();
+        };
+        let mw = multi_workspace.read(cx);
+        let workspaces: Vec<_> = mw.workspaces().cloned().collect();
+        let groups = mw.project_groups(cx);
+
+        let mut branch_by_path: HashMap<PathBuf, SharedString> = HashMap::new();
+        for workspace in &workspaces {
+            let project = workspace.read(cx).project().read(cx);
+            for repo in project.repositories(cx).values() {
+                let snapshot = repo.read(cx).snapshot();
+                if let Some(branch) = &snapshot.branch {
+                    branch_by_path.insert(
+                        snapshot.work_directory_abs_path.to_path_buf(),
+                        SharedString::from(Arc::<str>::from(branch.name())),
+                    );
+                }
+                for linked_worktree in snapshot.linked_worktrees() {
+                    if let Some(branch) = linked_worktree.branch_name() {
+                        branch_by_path.insert(
+                            linked_worktree.path.clone(),
+                            SharedString::from(Arc::<str>::from(branch)),
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut seen_thread_ids = HashSet::new();
+        let mut seen_terminal_ids = HashSet::new();
+        let mut targets = Vec::new();
+
+        for group in &groups {
+            let group_key = &group.key;
+            if group_key.path_list().paths().is_empty() {
+                continue;
+            }
+
+            let is_collapsed = mw
+                .group_state_by_key(group_key)
+                .map(|state| !state.expanded)
+                .unwrap_or(false);
+            if is_collapsed {
+                continue;
+            }
+
+            let group_workspaces = &group.workspaces;
+            let workspace_by_path_list: HashMap<PathList, Entity<Workspace>> = group_workspaces
+                .iter()
+                .map(|workspace| (workspace_path_list(workspace, cx), workspace.clone()))
+                .collect();
+            let resolve_workspace = |folder_paths: &PathList| -> ThreadEntryWorkspace {
+                workspace_by_path_list
+                    .get(folder_paths)
+                    .map(|workspace| ThreadEntryWorkspace::Open(workspace.clone()))
+                    .unwrap_or_else(|| ThreadEntryWorkspace::Closed {
+                        folder_paths: folder_paths.clone(),
+                        project_group_key: group_key.clone(),
+                    })
+            };
+
+            let mut buckets = Vec::new();
+            let mut bucket_indices = HashMap::new();
+
+            for slot in workspace::read_workspace_slots_for_project_group(group_key, cx) {
+                let path_list = slot.path_list();
+                let workspace = workspace_by_path_list.get(&path_list).cloned();
+                self.push_workspace_shortcut_bucket(
+                    &mut buckets,
+                    &mut bucket_indices,
+                    group_key,
+                    path_list,
+                    workspace,
+                    slot.label.as_deref(),
+                    &branch_by_path,
+                );
+            }
+            for slot_id in mw.opening_workspace_slots_for_project_group(group_key) {
+                let path_list = slot_id.path_list().clone();
+                let workspace = workspace_by_path_list.get(&path_list).cloned();
+                self.push_workspace_shortcut_bucket(
+                    &mut buckets,
+                    &mut bucket_indices,
+                    group_key,
+                    path_list,
+                    workspace,
+                    None,
+                    &branch_by_path,
+                );
+            }
+            for workspace in group_workspaces {
+                let path_list = workspace_path_list(workspace, cx);
+                self.push_workspace_shortcut_bucket(
+                    &mut buckets,
+                    &mut bucket_indices,
+                    group_key,
+                    path_list,
+                    Some(workspace.clone()),
+                    None,
+                    &branch_by_path,
+                );
+            }
+
+            let linked_worktree_path_lists =
+                linked_worktree_path_lists_for_workspaces(group_workspaces, cx);
+            let group_host = group_key.host();
+
+            {
+                let terminal_store = TerminalThreadMetadataStore::global(cx);
+                let mut push_terminal_metadata =
+                    |metadata: TerminalThreadMetadata, workspace: ThreadEntryWorkspace| {
+                        if !seen_terminal_ids.insert(metadata.terminal_id) {
+                            return;
+                        }
+                        Self::push_workspace_shortcut_chat(
+                            &mut buckets,
+                            &mut bucket_indices,
+                            WorkspaceShortcutChat::Terminal {
+                                metadata,
+                                workspace,
+                            },
+                            &branch_by_path,
+                            group_key.path_list(),
+                            cx,
+                        );
+                    };
+
+                for row in terminal_store
+                    .read(cx)
+                    .entries_for_main_worktree_path(group_key.path_list(), group_host.as_ref())
+                    .cloned()
+                {
+                    let workspace = resolve_workspace(row.folder_paths());
+                    push_terminal_metadata(row, workspace);
+                }
+                for row in terminal_store
+                    .read(cx)
+                    .entries_for_path(group_key.path_list(), group_host.as_ref())
+                    .cloned()
+                {
+                    let workspace = resolve_workspace(row.folder_paths());
+                    push_terminal_metadata(row, workspace);
+                }
+                for workspace in group_workspaces {
+                    let workspace_paths = workspace_path_list(workspace, cx);
+                    if workspace_paths.paths().is_empty() {
+                        continue;
+                    }
+                    for row in terminal_store
+                        .read(cx)
+                        .entries_for_path(&workspace_paths, group_host.as_ref())
+                        .cloned()
+                    {
+                        push_terminal_metadata(row, ThreadEntryWorkspace::Open(workspace.clone()));
+                    }
+                }
+                for worktree_path_list in &linked_worktree_path_lists {
+                    for row in terminal_store
+                        .read(cx)
+                        .entries_for_path(worktree_path_list, group_host.as_ref())
+                        .cloned()
+                    {
+                        push_terminal_metadata(
+                            row,
+                            ThreadEntryWorkspace::Closed {
+                                folder_paths: worktree_path_list.clone(),
+                                project_group_key: group_key.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+
+            {
+                let thread_store = ThreadMetadataStore::global(cx);
+                let mut push_thread_metadata =
+                    |metadata: ThreadMetadata, workspace: ThreadEntryWorkspace| {
+                        if metadata.is_draft() || !seen_thread_ids.insert(metadata.thread_id) {
+                            return;
+                        }
+                        Self::push_workspace_shortcut_chat(
+                            &mut buckets,
+                            &mut bucket_indices,
+                            WorkspaceShortcutChat::Thread {
+                                metadata,
+                                workspace,
+                            },
+                            &branch_by_path,
+                            group_key.path_list(),
+                            cx,
+                        );
+                    };
+
+                for row in thread_store
+                    .read(cx)
+                    .entries_for_main_worktree_path(group_key.path_list(), group_host.as_ref())
+                    .cloned()
+                {
+                    let workspace = resolve_workspace(row.folder_paths());
+                    push_thread_metadata(row, workspace);
+                }
+                for row in thread_store
+                    .read(cx)
+                    .entries_for_path(group_key.path_list(), group_host.as_ref())
+                    .cloned()
+                {
+                    let workspace = resolve_workspace(row.folder_paths());
+                    push_thread_metadata(row, workspace);
+                }
+                for workspace in group_workspaces {
+                    let workspace_paths = workspace_path_list(workspace, cx);
+                    if workspace_paths.paths().is_empty() {
+                        continue;
+                    }
+                    for row in thread_store
+                        .read(cx)
+                        .entries_for_path(&workspace_paths, group_host.as_ref())
+                        .cloned()
+                    {
+                        push_thread_metadata(row, ThreadEntryWorkspace::Open(workspace.clone()));
+                    }
+                }
+                for worktree_path_list in &linked_worktree_path_lists {
+                    for row in thread_store
+                        .read(cx)
+                        .entries_for_path(worktree_path_list, group_host.as_ref())
+                        .cloned()
+                    {
+                        push_thread_metadata(
+                            row,
+                            ThreadEntryWorkspace::Closed {
+                                folder_paths: worktree_path_list.clone(),
+                                project_group_key: group_key.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+
+            for bucket in &mut buckets {
+                bucket
+                    .chats
+                    .sort_by(|left, right| right.display_time().cmp(&left.display_time()));
+            }
+            buckets.sort_by(|left, right| {
+                right
+                    .is_main
+                    .cmp(&left.is_main)
+                    .then_with(|| left.label.to_lowercase().cmp(&right.label.to_lowercase()))
+                    .then_with(|| left.label.cmp(&right.label))
+                    .then_with(|| left.sort_key.cmp(&right.sort_key))
+            });
+
+            targets.extend(buckets.into_iter().map(|bucket| WorkspaceShortcutTarget {
+                project_group_key: bucket.project_group_key,
+                path_list: bucket.path_list,
+                workspace: bucket.workspace,
+                chats: bucket.chats,
+            }));
+        }
+
+        targets
+    }
+
+    fn is_active_workspace_shortcut_target(
+        &self,
+        target: &WorkspaceShortcutTarget,
+        cx: &App,
+    ) -> bool {
+        target
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| self.is_active_workspace(workspace, cx))
+    }
+
+    fn active_workspace_shortcut_chat_position(
+        &self,
+        target: &WorkspaceShortcutTarget,
+        cx: &App,
+    ) -> Option<usize> {
+        let workspace = target.workspace.as_ref()?;
+        let panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
+        let panel = panel.read(cx);
+        let active_thread_id = panel.active_thread_id(cx);
+        let active_session_id = panel
+            .active_agent_thread(cx)
+            .map(|thread| thread.read(cx).session_id().clone());
+        let active_terminal_id = panel.active_terminal_id();
+
+        target.chats.iter().position(|chat| {
+            chat.matches_active_chat(
+                active_thread_id,
+                active_session_id.as_ref(),
+                active_terminal_id,
+            )
+        })
+    }
+
+    fn activate_workspace_shortcut_chat(
+        &mut self,
+        chat: WorkspaceShortcutChat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match chat {
+            WorkspaceShortcutChat::Thread {
+                metadata,
+                workspace,
+            } => match workspace {
+                ThreadEntryWorkspace::Open(workspace) => {
+                    self.activate_thread(metadata, &workspace, true, window, cx);
+                }
+                ThreadEntryWorkspace::Closed {
+                    folder_paths,
+                    project_group_key,
+                } => {
+                    self.open_workspace_and_activate_thread(
+                        metadata,
+                        folder_paths,
+                        &project_group_key,
+                        window,
+                        cx,
+                    );
+                }
+            },
+            WorkspaceShortcutChat::Terminal {
+                metadata,
+                workspace,
+            } => {
+                self.activate_terminal_entry(metadata, workspace, true, window, cx);
+            }
+        }
+    }
+
+    fn activate_workspace_shortcut_target(
+        &mut self,
+        target: &WorkspaceShortcutTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(workspace) = &target.workspace {
+            if let Some(multi_workspace) = self.multi_workspace.upgrade() {
+                multi_workspace.update(cx, |multi_workspace, cx| {
+                    multi_workspace.activate(workspace.clone(), None, window, cx);
+                    multi_workspace.retain_active_workspace(cx);
+                });
+            }
+        } else {
+            self.open_workspace_slot(
+                &target.project_group_key,
+                target.path_list.clone(),
+                window,
+                cx,
+            );
+        }
+    }
+
+    fn activate_workspace_shortcut(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let targets = self.workspace_shortcut_targets(cx);
+        let Some(target) = targets.get(index).cloned() else {
+            return;
+        };
+
+        if self.is_active_workspace_shortcut_target(&target, cx) {
+            let Some(chat_count) = (!target.chats.is_empty()).then_some(target.chats.len()) else {
+                return;
+            };
+            let next_chat_ix = self
+                .active_workspace_shortcut_chat_position(&target, cx)
+                .map_or(0, |ix| (ix + 1) % chat_count);
+            let Some(chat) = target.chats.get(next_chat_ix).cloned() else {
+                return;
+            };
+            self.activate_workspace_shortcut_chat(chat, window, cx);
+        } else {
+            self.activate_workspace_shortcut_target(&target, window, cx);
+        }
+    }
+
+    fn activate_workspace_shortcut_action(
+        &mut self,
+        action: &ActivateWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_workspace_shortcut(action.0, window, cx);
+    }
+
     fn cycle_project_impl(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
@@ -7044,6 +7611,15 @@ impl WorkspaceSidebar for Sidebar {
         self.cycle_thread_impl(forward, window, cx);
     }
 
+    fn activate_workspace_at_index(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_workspace_shortcut(index, window, cx);
+    }
+
     fn serialized_state(&self, _cx: &App) -> Option<String> {
         let serialized = SerializedSidebar {
             width: Some(f32::from(self.width)),
@@ -7126,6 +7702,7 @@ impl Render for Sidebar {
             .on_action(cx.listener(Self::on_previous_project))
             .on_action(cx.listener(Self::on_next_thread))
             .on_action(cx.listener(Self::on_previous_thread))
+            .on_action(cx.listener(Self::activate_workspace_shortcut_action))
             .on_action(cx.listener(|this, _: &OpenRecent, window, cx| {
                 this.recent_projects_popover_handle.toggle(window, cx);
             }))
