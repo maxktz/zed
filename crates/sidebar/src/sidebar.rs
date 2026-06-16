@@ -1199,6 +1199,8 @@ impl Sidebar {
             .and_then(|ws| ws.read(cx).panel::<AgentPanel>(cx));
         if let Some(panel) = panel {
             self.sync_active_entry_from_panel(&panel, cx);
+        } else {
+            self.active_entry = None;
         }
     }
 
@@ -1273,6 +1275,7 @@ impl Sidebar {
                 terminal_id,
                 workspace: active_workspace,
             });
+            return false;
         } else if let Some(thread_id) = panel.active_thread_id(cx) {
             let is_archived = ThreadMetadataStore::global(cx)
                 .read(cx)
@@ -1287,9 +1290,11 @@ impl Sidebar {
                     session_id,
                     workspace: active_workspace,
                 });
+                return false;
             }
         }
 
+        self.active_entry = None;
         false
     }
 
@@ -2594,7 +2599,6 @@ impl Sidebar {
                             cx,
                         );
                         this.selection = None;
-                        this.active_entry = None;
                     }))
                 }),
         )
@@ -3129,7 +3133,6 @@ impl Sidebar {
                                                 );
                                             }
                                             sidebar.selection = None;
-                                            sidebar.active_entry = None;
                                         })
                                         .ok();
                                     }
@@ -3749,7 +3752,6 @@ impl Sidebar {
                         cx,
                     );
                     self.selection = None;
-                    self.active_entry = None;
                 }
             }
             ListEntry::Thread(thread) => {
@@ -6379,7 +6381,6 @@ impl Sidebar {
             self.open_workspace_for_group(key, window, cx);
         }
         self.selection = None;
-        self.active_entry = None;
     }
 
     fn active_project_group_key(&self, cx: &App) -> Option<ProjectGroupKey> {
