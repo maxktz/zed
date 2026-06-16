@@ -235,6 +235,45 @@ fn test_select_language(cx: &mut App) {
     );
 }
 
+#[gpui::test]
+fn test_superzed_config_files_use_jsonc(cx: &mut App) {
+    init_settings(cx, |_| {});
+
+    let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+    for config in [
+        LanguageConfig {
+            name: "JSON".into(),
+            matcher: LanguageMatcher {
+                path_suffixes: vec!["json".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        LanguageConfig {
+            name: "JSONC".into(),
+            ..Default::default()
+        },
+    ] {
+        registry.add(Arc::new(Language::new(config, None)));
+    }
+
+    for path in [
+        ".config/superzed/settings.json",
+        ".config/Superzed/settings.json",
+        ".config/superzed/keymap.json",
+        "AppData/Roaming/Superzed/tasks.json",
+        "AppData/Roaming/Superzed/debug.json",
+    ] {
+        assert_eq!(
+            registry
+                .language_for_file(&file(path), None, cx)
+                .map(|language| language.name()),
+            Some("JSONC".into()),
+            "{path}"
+        );
+    }
+}
+
 #[gpui::test(iterations = 10)]
 async fn test_first_line_pattern(cx: &mut TestAppContext) {
     cx.update(|cx| init_settings(cx, |_| {}));

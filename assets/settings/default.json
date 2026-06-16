@@ -1700,9 +1700,9 @@
       "**/*.crt",
       "**/.dev.vars",
       "**/secrets.yml",
-      "**/.zed/settings.json", // zed project settings
-      "/**/zed/settings.json", // zed user settings
-      "/**/zed/keymap.json",
+      "**/.zed/settings.json", // project settings
+      "/**/{zed,Zed,superzed,Superzed}/settings.json", // user settings
+      "/**/{zed,Zed,superzed,Superzed}/keymap.json",
     ],
     // When to show edit predictions previews in buffer.
     // This setting takes two possible values:
@@ -2049,7 +2049,7 @@
     "JSONC": [
       "**/.zed/*.json",
       "**/.vscode/**/*.json",
-      "**/{zed,Zed}/{settings,keymap,tasks,debug}.json",
+      "**/{zed,Zed,superzed,Superzed}/{settings,keymap,tasks,debug}.json",
       "tsconfig*.json",
     ],
     "Markdown": [".rules", ".cursorrules", ".windsurfrules", ".clinerules"],
