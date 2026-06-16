@@ -2389,15 +2389,8 @@ impl Sidebar {
                 is_active,
                 is_loading,
                 has_open_chats,
-            } => {
-                // The first worktree group in a project sits flush under the
-                // project header; later groups get a small gap above them.
-                let gap_above = ix > 0
-                    && !matches!(
-                        self.contents.entries.get(ix - 1),
-                        Some(ListEntry::ProjectHeader { .. })
-                    );
-                self.render_worktree_header(
+            } => self
+                .render_worktree_header(
                     ix,
                     project_group_key,
                     path_list,
@@ -2408,11 +2401,9 @@ impl Sidebar {
                     *is_loading,
                     *has_open_chats,
                     is_selected,
-                    gap_above,
                     cx,
                 )
-                .into_any_element()
-            }
+                .into_any_element(),
             ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
             ListEntry::Terminal(terminal) => {
                 self.render_terminal(ix, terminal, is_active, is_selected, cx)
@@ -2467,7 +2458,6 @@ impl Sidebar {
         is_loading: bool,
         has_open_chats: bool,
         is_focused: bool,
-        gap_above: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let color = cx.theme().colors();
@@ -2534,10 +2524,7 @@ impl Sidebar {
         let path_list_for_click = path_list.clone();
         let workspace_for_click = workspace.clone();
 
-        // Gap between consecutive worktree groups lives on a transparent
-        // wrapper (top padding) so it isn't clipped like a list-item margin
-        // and so the header's own hover background doesn't fill it.
-        div().when(gap_above, |this| this.pt(px(4.))).child(
+        div().child(
             h_flex()
                 .id(SharedString::from(format!("worktree-header-{ix}")))
                 .group(&group_name)
