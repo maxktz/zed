@@ -130,8 +130,7 @@ pub struct TerminalAgentRestoreState {
     #[serde(default = "default_agent_kind")]
     pub agent: TerminalAgentKind,
     /// The agent's native session id, used to resume after a restart. `None`
-    /// when the agent is running but hasn't surfaced a session yet (notably
-    /// Codex, which only writes its session file on the first prompt).
+    /// when the agent is running but hasn't surfaced a session yet.
     #[serde(default)]
     pub session_id: Option<String>,
 }

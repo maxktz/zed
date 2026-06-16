@@ -16764,6 +16764,7 @@ dependencies = [
  "serde_json",
  "settings",
  "telemetry",
+ "terminal_view",
  "theme",
  "theme_settings",
  "ui",

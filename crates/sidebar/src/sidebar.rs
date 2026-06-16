@@ -30,8 +30,8 @@ use editor::Editor;
 use feature_flags::{AgentThreadWorktreeLabelFlag, FeatureFlag};
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, DismissEvent, Entity, FocusHandle,
-    Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task, TaskExt,
-    TextStyleRefinement, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle,
+    Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Subscription, Task,
+    TaskExt, TextStyleRefinement, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle,
     linear_color_stop, linear_gradient, list, prelude::*, px, relative,
 };
 use itertools::Itertools;
@@ -53,6 +53,10 @@ use std::mem;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use terminal_view::{
+    TerminalAgentActivity, TerminalView,
+    terminal_panel::{TerminalPanel, TerminalPanelEvent},
+};
 use theme::ActiveTheme;
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, GradientFade,
@@ -66,7 +70,7 @@ use util::path_list::PathList;
 use workspace::{
     ActivateWorkspace, CloseWindow, FocusWorkspaceSidebar, MultiWorkspace, MultiWorkspaceEvent,
     NextProject, NextThread, Open, OpenMode, PreviousProject, PreviousThread, ProjectGroupKey,
-    Sidebar as WorkspaceSidebar, SidebarSide, Toast, ToggleWorkspaceSidebar, Workspace,
+    SaveIntent, Sidebar as WorkspaceSidebar, SidebarSide, Toast, ToggleWorkspaceSidebar, Workspace,
     WorkspaceSlotId, notifications::NotificationId, sidebar_side_context_menu,
 };
 
@@ -875,6 +879,7 @@ pub struct Sidebar {
     project_header_new_thread_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
     project_header_menu_ix: Option<usize>,
     hidden_workspace_slots: HashSet<WorkspaceSlotId>,
+    live_terminal_subscriptions: HashMap<gpui::EntityId, Subscription>,
     _subscriptions: Vec<gpui::Subscription>,
     update_task: Option<Task<()>>,
     /// For the thread import banners, if there is just one we show "Import
@@ -930,7 +935,7 @@ impl Sidebar {
             window,
             |this, _multi_workspace, event: &MultiWorkspaceEvent, window, cx| match event {
                 MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } => {
-                    this.sync_active_entry_from_active_workspace(cx);
+                    this.sync_active_entry_from_active_workspace(Some(window), cx);
                     this.replace_archived_panel_thread(window, cx);
                     this.schedule_update_entries(false, cx);
                 }
@@ -1034,6 +1039,7 @@ impl Sidebar {
             project_header_new_thread_menu_handles: HashMap::new(),
             project_header_menu_ix: None,
             hidden_workspace_slots: HashSet::new(),
+            live_terminal_subscriptions: HashMap::new(),
             _subscriptions: Vec::new(),
             update_task: None,
             import_banners_use_verbose_labels: None,
@@ -1135,13 +1141,25 @@ impl Sidebar {
         cx.subscribe_in(
             workspace,
             window,
-            move |this, workspace, event: &workspace::Event, window, cx| {
-                if let workspace::Event::PanelAdded(view) = event {
+            move |this, workspace, event: &workspace::Event, window, cx| match event {
+                workspace::Event::PanelAdded(view) => {
                     if let Ok(agent_panel) = view.clone().downcast::<AgentPanel>() {
                         this.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
                         this.schedule_update_entries(false, cx);
+                    } else if let Ok(terminal_panel) = view.clone().downcast::<TerminalPanel>() {
+                        this.observe_terminal_panel(&terminal_panel, window, cx);
+                        this.schedule_update_entries(false, cx);
                     }
                 }
+                workspace::Event::ItemAdded { .. }
+                | workspace::Event::ItemRemoved { .. } => {
+                    this.schedule_update_entries(false, cx);
+                }
+                workspace::Event::ActiveItemChanged => {
+                    this.sync_active_entry_from_active_workspace(Some(window), cx);
+                    this.schedule_update_entries(false, cx);
+                }
+                _ => {}
             },
         )
         .detach();
@@ -1151,6 +1169,40 @@ impl Sidebar {
         if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
             self.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
         }
+        if let Some(terminal_panel) = workspace.read(cx).panel::<TerminalPanel>(cx) {
+            self.observe_terminal_panel(&terminal_panel, window, cx);
+        }
+    }
+
+    fn observe_terminal_panel(
+        &mut self,
+        terminal_panel: &Entity<TerminalPanel>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.subscribe_in(
+            terminal_panel,
+            window,
+            |this, _, event: &TerminalPanelEvent, window, cx| match event {
+                TerminalPanelEvent::ActiveTerminalChanged => {
+                    this.sync_active_entry_from_active_workspace(Some(window), cx);
+                    this.schedule_update_entries(false, cx);
+                }
+            },
+        )
+        .detach();
+
+        let focus_handle = terminal_panel.read(cx).focus_handle(cx);
+        cx.on_focus_in(&focus_handle, window, |this, window, cx| {
+            this.sync_active_entry_from_active_workspace(Some(window), cx);
+            this.schedule_update_entries(false, cx);
+        })
+        .detach();
+
+        cx.observe(terminal_panel, |this, _, cx| {
+            this.schedule_update_entries(false, cx);
+        })
+        .detach();
     }
 
     fn move_entry_paths(
@@ -1248,10 +1300,81 @@ impl Sidebar {
         .detach();
     }
 
-    fn sync_active_entry_from_active_workspace(&mut self, cx: &App) {
-        let panel = self
-            .active_workspace(cx)
-            .and_then(|ws| ws.read(cx).panel::<AgentPanel>(cx));
+    fn sync_active_terminal_view(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        terminal_view: Entity<TerminalView>,
+        cx: &App,
+    ) -> bool {
+        let Some(terminal_id) = TerminalThreadMetadataStore::global(cx)
+            .read(cx)
+            .terminal_id_for_entity(terminal_view.entity_id())
+        else {
+            return false;
+        };
+
+        self.active_entry = Some(ActiveEntry::Terminal {
+            terminal_id,
+            workspace: workspace.clone(),
+        });
+        true
+    }
+
+    fn sync_active_terminal_panel(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        terminal_panel: &Entity<TerminalPanel>,
+        cx: &App,
+    ) -> bool {
+        let Some(terminal_view) = terminal_panel.read(cx).active_terminal_view(cx) else {
+            return false;
+        };
+        self.sync_active_terminal_view(workspace, terminal_view, cx)
+    }
+
+    fn sync_active_entry_from_active_workspace(&mut self, window: Option<&Window>, cx: &App) {
+        let Some(workspace) = self.active_workspace(cx) else {
+            self.active_entry = None;
+            return;
+        };
+
+        if let Some(window) = window {
+            if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx)
+                && agent_panel
+                    .read(cx)
+                    .focus_handle(cx)
+                    .contains_focused(window, cx)
+            {
+                self.sync_active_entry_from_panel(&agent_panel, cx);
+                return;
+            }
+
+            if let Some(terminal_panel) = workspace.read(cx).panel::<TerminalPanel>(cx)
+                && terminal_panel
+                    .read(cx)
+                    .focus_handle(cx)
+                    .contains_focused(window, cx)
+            {
+                if !self.sync_active_terminal_panel(&workspace, &terminal_panel, cx) {
+                    self.active_entry = None;
+                }
+                return;
+            }
+        }
+
+        if let Some(terminal_view) = workspace.read(cx).active_item_as::<TerminalView>(cx)
+            && self.sync_active_terminal_view(&workspace, terminal_view, cx)
+        {
+            return;
+        }
+
+        if let Some(terminal_panel) = workspace.read(cx).panel::<TerminalPanel>(cx)
+            && self.sync_active_terminal_panel(&workspace, &terminal_panel, cx)
+        {
+            return;
+        }
+
+        let panel = workspace.read(cx).panel::<AgentPanel>(cx);
         if let Some(panel) = panel {
             self.sync_active_entry_from_panel(&panel, cx);
         } else {
@@ -1280,6 +1403,119 @@ impl Sidebar {
         if is_archived {
             self.create_new_thread(&workspace, window, cx);
         }
+    }
+
+    fn terminal_status_from_activity(activity: TerminalAgentActivity) -> AgentThreadStatus {
+        match activity {
+            TerminalAgentActivity::Running => AgentThreadStatus::Running,
+            TerminalAgentActivity::WaitingForConfirmation => {
+                AgentThreadStatus::WaitingForConfirmation
+            }
+            TerminalAgentActivity::Idle => AgentThreadStatus::Completed,
+        }
+    }
+
+    fn sync_live_terminal_agents(
+        &mut self,
+        workspaces: &[Entity<Workspace>],
+        cx: &mut Context<Self>,
+    ) {
+        let terminal_store = TerminalThreadMetadataStore::global(cx);
+        let mut live_entity_ids = HashSet::new();
+
+        for workspace in workspaces {
+            let mut terminal_views = workspace
+                .read(cx)
+                .items_of_type::<TerminalView>(cx)
+                .collect::<Vec<_>>();
+
+            if let Some(terminal_panel) = workspace.read(cx).panel::<TerminalPanel>(cx) {
+                terminal_views.extend(
+                    terminal_panel
+                        .read(cx)
+                        .panel_terminal_views(cx)
+                        .into_iter()
+                        .map(|(_, _, terminal_view)| terminal_view),
+                );
+            }
+            if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+                terminal_views.extend(
+                    agent_panel
+                        .read(cx)
+                        .terminal_views()
+                        .into_iter()
+                        .map(|(_, terminal_view)| terminal_view),
+                );
+            }
+
+            for terminal_view in terminal_views {
+                terminal_view.update(cx, |terminal_view, cx| {
+                    terminal_view.refresh_agent_restore_state(cx);
+                });
+
+                let terminal_id = terminal_store
+                    .read(cx)
+                    .terminal_id_for_entity(terminal_view.entity_id());
+                let should_track = terminal_view.read(cx).is_terminal_agent();
+
+                if !should_track {
+                    continue;
+                }
+
+                let terminal_entity_id = terminal_view.entity_id();
+                live_entity_ids.insert(terminal_entity_id);
+                if !self
+                    .live_terminal_subscriptions
+                    .contains_key(&terminal_entity_id)
+                {
+                    let subscription = cx.observe(&terminal_view, |this, _, cx| {
+                        this.schedule_update_entries(false, cx);
+                    });
+                    self.live_terminal_subscriptions
+                        .insert(terminal_entity_id, subscription);
+                }
+
+                let existing = terminal_id
+                    .and_then(|terminal_id| terminal_store.read(cx).entry(terminal_id).cloned());
+                let now = Utc::now();
+                let terminal_entity = terminal_view.read(cx).terminal().clone();
+                let title = terminal_view
+                    .read(cx)
+                    .terminal_agent_display_title(cx)
+                    .or_else(|| existing.as_ref().map(|metadata| metadata.title.clone()))
+                    .unwrap_or_else(|| terminal_entity.read(cx).title(true).into());
+                let activity = terminal_view.read(cx).agent_activity();
+                let last_activity_at = existing
+                    .as_ref()
+                    .and_then(|metadata| metadata.last_activity_at)
+                    .or_else(|| (activity != TerminalAgentActivity::Idle).then_some(now));
+                let project = workspace.read(cx).project().clone();
+                let project_read = project.read(cx);
+                let metadata = TerminalThreadMetadata {
+                    terminal_id: terminal_id.unwrap_or_else(TerminalId::new),
+                    title,
+                    custom_title: None,
+                    created_at: existing
+                        .as_ref()
+                        .map_or_else(Utc::now, |metadata| metadata.created_at),
+                    last_activity_at,
+                    worktree_paths: project_read.worktree_paths(cx),
+                    remote_connection: project_read.remote_connection_options(cx),
+                    working_directory: terminal_entity.read(cx).working_directory(),
+                    agent_restore_state: terminal_view.read(cx).agent_restore_state(),
+                };
+
+                terminal_store.update(cx, |store, cx| {
+                    store.upsert_live_terminal(&terminal_view, metadata, cx);
+                });
+            }
+        }
+
+        terminal_store.update(cx, |store, cx| {
+            store.retain_live_terminal_entities(&live_entity_ids, cx);
+        });
+        self.live_terminal_subscriptions
+            .retain(|entity_id, _| live_entity_ids.contains(entity_id));
     }
 
     /// Syncs `active_entry` from the agent panel's current state.
@@ -1325,7 +1561,12 @@ impl Sidebar {
             return false;
         }
 
-        if let Some(terminal_id) = panel.active_terminal_id() {
+        if let Some(terminal_id) = panel.active_terminal_id()
+            && TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(terminal_id)
+                .is_some()
+        {
             self.active_entry = Some(ActiveEntry::Terminal {
                 terminal_id,
                 workspace: active_workspace,
@@ -1589,13 +1830,21 @@ impl Sidebar {
     ///     - If you have no threads, and two workspaces for the worktree and the main workspace, make sure at least one is shown
     /// - Should always show every thread, associated with each workspace in the multiworkspace
     /// - After every build_contents, our "active" state should exactly match the current workspace's, current agent panel's current thread.
-    fn rebuild_contents(&mut self, cx: &App) {
+    fn rebuild_contents(&mut self, cx: &mut Context<Self>) {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
         };
+        let (workspaces, active_workspace) = {
+            let mw = multi_workspace.read(cx);
+            (
+                mw.workspaces().cloned().collect::<Vec<_>>(),
+                Some(mw.workspace().clone()),
+            )
+        };
+
+        self.sync_live_terminal_agents(&workspaces, cx);
+
         let mw = multi_workspace.read(cx);
-        let workspaces: Vec<_> = mw.workspaces().cloned().collect();
-        let active_workspace = Some(mw.workspace().clone());
 
         let agent_server_store = workspaces
             .first()
@@ -1650,15 +1899,28 @@ impl Sidebar {
         // Live agent activity per terminal, mapped onto the shared thread
         // status so terminal rows render like chat rows.
         let mut live_terminal_statuses: HashMap<TerminalId, AgentThreadStatus> = HashMap::new();
-        for workspace in &workspaces {
-            if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-                for terminal in agent_panel.read(cx).terminals(cx) {
-                    if terminal.has_notification {
-                        live_notified_terminal_ids.insert(terminal.id);
-                    }
-                    live_terminal_statuses.insert(terminal.id, terminal.status);
-                }
+        let terminal_store = TerminalThreadMetadataStore::global(cx);
+        let live_terminal_views = {
+            let store = terminal_store.read(cx);
+            store
+                .entries()
+                .filter_map(|metadata| {
+                    store
+                        .live_terminal(metadata.terminal_id)
+                        .and_then(|terminal_view| terminal_view.upgrade())
+                        .map(|terminal_view| (metadata.terminal_id, terminal_view))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (terminal_id, terminal_view) in live_terminal_views {
+            let terminal_view = terminal_view.read(cx);
+            if terminal_view.has_bell() {
+                live_notified_terminal_ids.insert(terminal_id);
             }
+            live_terminal_statuses.insert(
+                terminal_id,
+                Self::terminal_status_from_activity(terminal_view.agent_activity()),
+            );
         }
 
         let mut all_paths: Vec<PathBuf> = groups
@@ -4827,6 +5089,71 @@ impl Sidebar {
         .detach_and_log_err(cx);
     }
 
+    fn activate_live_terminal_in_workspace(
+        workspace: &Entity<Workspace>,
+        terminal_id: TerminalId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some(terminal_view) = TerminalThreadMetadataStore::global(cx)
+            .read(cx)
+            .live_terminal(terminal_id)
+            .and_then(|terminal_view| terminal_view.upgrade())
+        else {
+            return false;
+        };
+
+        workspace.update(cx, |workspace, cx| {
+            if workspace.activate_item(&terminal_view, true, true, window, cx) {
+                return true;
+            }
+
+            let Some(terminal_panel) = workspace.panel::<TerminalPanel>(cx) else {
+                return false;
+            };
+            let target = terminal_panel
+                .read(cx)
+                .panel_terminal_views(cx)
+                .into_iter()
+                .find(|(_, _, view)| view == &terminal_view);
+            let Some((item_index, pane, _)) = target else {
+                return false;
+            };
+
+            terminal_panel.update(cx, |terminal_panel, cx| {
+                terminal_panel.activate_terminal_view(&pane, item_index, true, window, cx);
+            });
+            workspace.focus_panel::<TerminalPanel>(window, cx);
+            true
+        })
+    }
+
+    fn close_live_terminal_in_workspace(
+        workspace: &Entity<Workspace>,
+        terminal_id: TerminalId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some(terminal_view) = TerminalThreadMetadataStore::global(cx)
+            .read(cx)
+            .live_terminal(terminal_id)
+            .and_then(|terminal_view| terminal_view.upgrade())
+        else {
+            return false;
+        };
+
+        workspace.update(cx, |workspace, cx| {
+            let Some(pane) = workspace.pane_for(&terminal_view) else {
+                return false;
+            };
+            pane.update(cx, |pane, cx| {
+                pane.close_item_by_id(terminal_view.entity_id(), SaveIntent::Close, window, cx)
+            })
+            .detach_and_log_err(cx);
+            true
+        })
+    }
+
     fn activate_terminal_in_workspace(
         &mut self,
         workspace: &Entity<Workspace>,
@@ -4853,7 +5180,9 @@ impl Sidebar {
             }
         });
 
-        Self::load_agent_terminal_in_workspace(workspace, &metadata, true, window, cx);
+        if !Self::activate_live_terminal_in_workspace(workspace, terminal_id, window, cx) {
+            Self::load_agent_terminal_in_workspace(workspace, &metadata, true, window, cx);
+        }
 
         self.update_entries(cx);
     }
@@ -4955,13 +5284,15 @@ impl Sidebar {
         // Closing from the sidebar must not steal focus, since the row's
         // workspace may not be the active workspace.
         if let ThreadEntryWorkspace::Open(workspace) = workspace {
-            workspace.update(cx, |workspace, cx| {
-                if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                    panel.update(cx, |panel, cx| {
-                        panel.close_terminal(terminal_id, window, cx);
-                    });
-                }
-            });
+            if !Self::close_live_terminal_in_workspace(workspace, terminal_id, window, cx) {
+                workspace.update(cx, |workspace, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            panel.close_terminal(terminal_id, window, cx);
+                        });
+                    }
+                });
+            }
         }
         if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
             store.update(cx, |store, cx| {
@@ -4977,7 +5308,7 @@ impl Sidebar {
             {
                 return;
             }
-            self.sync_active_entry_from_active_workspace(cx);
+            self.sync_active_entry_from_active_workspace(Some(window), cx);
         }
         self.update_entries(cx);
     }

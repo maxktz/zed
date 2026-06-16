@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -11,17 +12,40 @@ use db::{
     sqlez_macros::sql,
 };
 use futures::{FutureExt, future::Shared};
-use gpui::{AppContext as _, Entity, Global, Task};
+use gpui::{AppContext as _, Entity, EntityId, Global, Task, WeakEntity};
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
 use ui::{App, Context, SharedString};
 use util::ResultExt as _;
 use workspace::PathList;
 
-use crate::{TerminalId, thread_metadata_store::WorktreePaths};
-use terminal_view::TerminalAgentRestoreState;
+use crate::thread_metadata_store::WorktreePaths;
+use terminal_view::{TerminalAgentRestoreState, TerminalView};
 
 pub fn init(cx: &mut App) {
     TerminalThreadMetadataStore::init_global(cx);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct TerminalId(uuid::Uuid);
+
+impl TerminalId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+
+    pub fn to_key_string(self) -> String {
+        self.0.hyphenated().to_string()
+    }
+
+    pub fn from_key_string(key: &str) -> anyhow::Result<Self> {
+        Ok(Self(uuid::Uuid::parse_str(key)?))
+    }
+}
+
+impl fmt::Display for TerminalId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
 }
 
 struct GlobalTerminalThreadMetadataStore(Entity<TerminalThreadMetadataStore>);
@@ -142,10 +166,11 @@ pub fn terminal_title_prefix(title: &str) -> Option<&str> {
 }
 
 pub struct TerminalThreadMetadataStore {
-    db: TerminalThreadMetadataDb,
     terminals: HashMap<TerminalId, TerminalThreadMetadata>,
     terminals_by_paths: HashMap<PathList, HashSet<TerminalId>>,
     terminals_by_main_paths: HashMap<PathList, HashSet<TerminalId>>,
+    live_terminals: HashMap<TerminalId, WeakEntity<TerminalView>>,
+    terminal_ids_by_entity: HashMap<EntityId, TerminalId>,
     reload_task: Option<Shared<Task<()>>>,
     pending_terminal_ops_tx: async_channel::Sender<DbOperation>,
     _db_operations_task: Task<()>,
@@ -201,6 +226,14 @@ impl TerminalThreadMetadataStore {
 
     pub fn entries(&self) -> impl Iterator<Item = &TerminalThreadMetadata> + '_ {
         self.terminals.values()
+    }
+
+    pub fn live_terminal(&self, terminal_id: TerminalId) -> Option<WeakEntity<TerminalView>> {
+        self.live_terminals.get(&terminal_id).cloned()
+    }
+
+    pub fn terminal_id_for_entity(&self, entity_id: EntityId) -> Option<TerminalId> {
+        self.terminal_ids_by_entity.get(&entity_id).copied()
     }
 
     pub fn reload_task(&self) -> Shared<Task<()>> {
@@ -268,6 +301,65 @@ impl TerminalThreadMetadataStore {
     pub fn save(&mut self, metadata: TerminalThreadMetadata, cx: &mut Context<Self>) {
         self.save_internal(metadata);
         cx.notify();
+    }
+
+    pub fn upsert_live_terminal(
+        &mut self,
+        terminal_view: &Entity<TerminalView>,
+        metadata: TerminalThreadMetadata,
+        cx: &mut Context<Self>,
+    ) -> TerminalId {
+        let entity_id = terminal_view.entity_id();
+        let terminal_id = self
+            .terminal_ids_by_entity
+            .get(&entity_id)
+            .copied()
+            .unwrap_or(metadata.terminal_id);
+        self.terminal_ids_by_entity.insert(entity_id, terminal_id);
+        self.live_terminals
+            .insert(terminal_id, terminal_view.downgrade());
+
+        let metadata = TerminalThreadMetadata {
+            terminal_id,
+            ..metadata
+        };
+        if self.terminals.get(&terminal_id) != Some(&metadata) {
+            self.save_internal(metadata);
+            cx.notify();
+        }
+        terminal_id
+    }
+
+    pub fn remove_live_terminal_entity(
+        &mut self,
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
+        let entity_id = terminal_view.entity_id();
+        if let Some(terminal_id) = self.terminal_ids_by_entity.remove(&entity_id) {
+            self.live_terminals.remove(&terminal_id);
+            self.delete(terminal_id, cx);
+        }
+    }
+
+    pub fn retain_live_terminal_entities(
+        &mut self,
+        live_entity_ids: &std::collections::HashSet<EntityId>,
+        cx: &mut Context<Self>,
+    ) {
+        let stale_entity_ids = self
+            .terminal_ids_by_entity
+            .keys()
+            .filter(|entity_id| !live_entity_ids.contains(entity_id))
+            .copied()
+            .collect::<Vec<_>>();
+
+        for entity_id in stale_entity_ids {
+            if let Some(terminal_id) = self.terminal_ids_by_entity.remove(&entity_id) {
+                self.live_terminals.remove(&terminal_id);
+                self.delete(terminal_id, cx);
+            }
+        }
     }
 
     pub fn change_worktree_paths(
@@ -391,17 +483,16 @@ impl TerminalThreadMetadataStore {
             }
         });
 
-        let mut this = Self {
-            db,
+        Self {
             terminals: HashMap::default(),
             terminals_by_paths: HashMap::default(),
             terminals_by_main_paths: HashMap::default(),
+            live_terminals: HashMap::default(),
+            terminal_ids_by_entity: HashMap::default(),
             reload_task: None,
             pending_terminal_ops_tx: tx,
             _db_operations_task,
-        };
-        this.reload(cx);
-        this
+        }
     }
 
     fn dedup_db_operations(operations: Vec<DbOperation>) -> Vec<DbOperation> {
@@ -413,36 +504,6 @@ impl TerminalThreadMetadataStore {
             ops.insert(operation.id(), operation);
         }
         ops.into_values().collect()
-    }
-
-    fn reload(&mut self, cx: &mut Context<Self>) {
-        let db = self.db.clone();
-        self.reload_task = Some(
-            cx.spawn(async move |this, cx| {
-                let rows = cx
-                    .background_spawn(async move {
-                        db.list()
-                            .context("Failed to fetch terminal thread metadata")
-                    })
-                    .await
-                    .log_err()
-                    .unwrap_or_default();
-
-                this.update(cx, |this, cx| {
-                    this.terminals.clear();
-                    this.terminals_by_paths.clear();
-                    this.terminals_by_main_paths.clear();
-
-                    for row in rows {
-                        this.cache_terminal_metadata(row);
-                    }
-
-                    cx.notify();
-                })
-                .ok();
-            })
-            .shared(),
-        );
     }
 }
 
@@ -480,16 +541,6 @@ impl Domain for TerminalThreadMetadataDb {
 db::static_connection!(TerminalThreadMetadataDb, []);
 
 impl TerminalThreadMetadataDb {
-    pub fn list(&self) -> anyhow::Result<Vec<TerminalThreadMetadata>> {
-        self.select::<TerminalThreadMetadata>(
-            "SELECT terminal_id, title, custom_title, created_at, \
-            working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
-            main_worktree_paths_order, remote_connection, codex_restore_state, last_activity_at \
-            FROM sidebar_terminal_threads \
-            ORDER BY created_at DESC",
-        )?()
-    }
-
     pub async fn save(&self, row: TerminalThreadMetadata) -> anyhow::Result<()> {
         let terminal_id = row.terminal_id.to_key_string();
         let title = row.title.to_string();

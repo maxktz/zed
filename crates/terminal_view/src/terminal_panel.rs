@@ -52,6 +52,10 @@ actions!(
     ]
 );
 
+pub enum TerminalPanelEvent {
+    ActiveTerminalChanged,
+}
+
 pub fn init(cx: &mut App) {
     cx.observe_new(
         |workspace: &mut Workspace, _window, _: &mut Context<Workspace>| {
@@ -344,7 +348,11 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) {
         match event {
-            pane::Event::ActivateItem { .. } => self.serialize(cx),
+            pane::Event::ActivateItem { .. } => {
+                self.serialize(cx);
+                cx.emit(TerminalPanelEvent::ActiveTerminalChanged);
+                cx.notify();
+            }
             pane::Event::RemovedItem { .. } => self.serialize(cx),
             pane::Event::Remove { focus_on_pane } => {
                 let pane_count_before_removal = self.center.panes().len();
@@ -429,6 +437,8 @@ impl TerminalPanel {
             }
             pane::Event::Focus => {
                 self.active_pane = pane.clone();
+                cx.emit(TerminalPanelEvent::ActiveTerminalChanged);
+                cx.notify();
             }
             pane::Event::ItemPinned | pane::Event::ItemUnpinned => {
                 self.serialize(cx);
@@ -696,7 +706,7 @@ impl TerminalPanel {
 
     pub(crate) fn terminal_views(
         &self,
-        cx: &mut App,
+        cx: &App,
     ) -> Vec<(usize, Entity<Pane>, Entity<TerminalView>)> {
         let Some(workspace) = self.workspace.upgrade() else {
             return Vec::new();
@@ -719,9 +729,9 @@ impl TerminalPanel {
             .collect()
     }
 
-    pub(crate) fn panel_terminal_views(
+    pub fn panel_terminal_views(
         &self,
-        cx: &mut App,
+        cx: &App,
     ) -> Vec<(usize, Entity<Pane>, Entity<TerminalView>)> {
         self.center
             .panes()
@@ -731,9 +741,16 @@ impl TerminalPanel {
             .collect()
     }
 
+    pub fn active_terminal_view(&self, cx: &App) -> Option<Entity<TerminalView>> {
+        self.active_pane
+            .read(cx)
+            .active_item()?
+            .act_as::<TerminalView>(cx)
+    }
+
     fn terminal_views_in_pane(
         pane: &Entity<Pane>,
-        cx: &mut App,
+        cx: &App,
     ) -> Vec<(usize, Entity<Pane>, Entity<TerminalView>)> {
         pane.read(cx)
             .items()
@@ -761,7 +778,7 @@ impl TerminalPanel {
             .collect()
     }
 
-    pub(crate) fn activate_terminal_view(
+    pub fn activate_terminal_view(
         &self,
         pane: &Entity<Pane>,
         item_index: usize,
@@ -1388,6 +1405,7 @@ impl workspace::Item for FailedToSpawnTerminal {
 }
 
 impl EventEmitter<PanelEvent> for TerminalPanel {}
+impl EventEmitter<TerminalPanelEvent> for TerminalPanel {}
 
 impl Render for TerminalPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

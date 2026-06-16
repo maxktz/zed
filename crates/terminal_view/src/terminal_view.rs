@@ -5,15 +5,16 @@ pub mod terminal_panel;
 mod terminal_path_like_target;
 pub mod terminal_scrollbar;
 
-use terminal_agents::TerminalAgentTracker;
 pub use terminal_agents::{
     TerminalAgentActivity, TerminalAgentKind, TerminalAgentRestoreState, TerminalAgentTitle,
 };
+use terminal_agents::TerminalAgentTracker;
 
 use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,
     ui_scrollbar_settings_from_raw,
 };
+use futures::StreamExt as _;
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, DismissEvent, Entity, EventEmitter, ExternalPaths,
     FocusHandle, Focusable, Font, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
@@ -359,6 +360,8 @@ pub struct TerminalView {
     agent_notification_activation_handler: Option<TerminalAgentNotificationActivationHandler>,
     agent_notifications_enabled: bool,
     agent_tracker: TerminalAgentTracker,
+    last_agent_title: Option<SharedString>,
+    _agent_state_watcher: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
 }
@@ -481,6 +484,31 @@ impl TerminalView {
             cx.observe_global::<SettingsStore>(Self::settings_changed),
         ];
 
+        let agent_state_watcher = terminal
+            .read(cx)
+            .agent_session_state_path()
+            .map(|path| path.to_path_buf())
+            .and_then(|path| {
+                let fs = project.upgrade()?.read(cx).fs().clone();
+                Some(cx.spawn(async move |this, cx| {
+                    let (mut events, _watcher) = fs.watch(&path, Duration::from_millis(100)).await;
+                    while events.next().await.is_some() {
+                        if this
+                            .update(cx, |this, cx| {
+                                if this.refresh_agent_restore_state(cx) {
+                                    this.needs_serialize = true;
+                                    cx.emit(ItemEvent::UpdateTab);
+                                    cx.emit(Event::Wakeup);
+                                }
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }))
+            });
+
         Self {
             terminal,
             workspace: workspace_handle,
@@ -510,6 +538,8 @@ impl TerminalView {
             agent_notification_activation_handler: None,
             agent_notifications_enabled: true,
             agent_tracker: TerminalAgentTracker::default(),
+            last_agent_title: None,
+            _agent_state_watcher: agent_state_watcher,
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }
@@ -728,24 +758,62 @@ impl TerminalView {
         self.agent_tracker.activity()
     }
 
+    pub fn is_terminal_agent(&self) -> bool {
+        self.agent_tracker.restore_state().is_some()
+    }
+
+    pub fn terminal_agent_display_title(&self, cx: &App) -> Option<SharedString> {
+        self.custom_title
+            .as_ref()
+            .filter(|title| !title.trim().is_empty())
+            .map(|title| SharedString::from(title.clone()))
+            .or_else(|| self.last_agent_title.clone())
+            .or_else(|| {
+                self.agent_tracker
+                    .restore_state()
+                    .is_some()
+                    .then(|| self.terminal.read(cx).title(true).into())
+            })
+    }
+
     /// Recomputes the agent state/activity. Returns whether anything changed.
-    pub fn refresh_agent_restore_state(&mut self, cx: &App) -> bool {
-        let terminal = self.terminal.read(cx);
-        self.agent_tracker.refresh(terminal)
+    pub fn refresh_agent_restore_state(&mut self, cx: &mut Context<Self>) -> bool {
+        let previous_agent_title = self.last_agent_title.clone();
+        let state_changed = {
+            let terminal = self.terminal.read(cx);
+            let state_changed = self.agent_tracker.refresh(terminal);
+            if self.agent_tracker.restore_state().is_some() {
+                self.last_agent_title = match self.agent_tracker.agent_title() {
+                    TerminalAgentTitle::Idle => self.last_agent_title.clone(),
+                    TerminalAgentTitle::TerminalTitle => Some(terminal.title(true).into()),
+                    TerminalAgentTitle::Name(name) => Some(SharedString::from(name)),
+                };
+            } else {
+                self.last_agent_title = None;
+            }
+            state_changed
+        };
+        let changed = state_changed || self.last_agent_title != previous_agent_title;
+        if changed {
+            cx.notify();
+        }
+        changed
     }
 
     pub fn restore_agent_session(
         &mut self,
         restore_state: TerminalAgentRestoreState,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
+        let Some(resume_input) = restore_state.resume_input() else {
+            return false;
+        };
+
         let terminal = self.terminal.clone();
-        if let Some(resume_input) = restore_state.resume_input() {
-            terminal.update(cx, |terminal, _cx| {
-                terminal.input(resume_input);
-            });
-        }
-        self.agent_tracker.set_restore_state(restore_state);
+        terminal.update(cx, |terminal, _cx| {
+            terminal.input(resume_input);
+        });
+        true
     }
 
     fn notify_if_agent_needs_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -768,6 +836,13 @@ impl TerminalView {
             .foreground_process_command_name()
             .as_deref()
             .and_then(TerminalAgentKind::from_command_name)
+    }
+
+    fn terminal_agent_icon(&self) -> Option<IconName> {
+        self.agent_restore_state().map(|state| match state.agent {
+            TerminalAgentKind::Claude => IconName::AiClaude,
+            TerminalAgentKind::Codex => IconName::AiOpenAi,
+        })
     }
 
     fn show_agent_notification(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -793,8 +868,8 @@ impl TerminalView {
             .or_else(|| self.agent_tracker.restore_state().map(|state| state.agent))
             .unwrap_or(TerminalAgentKind::Codex);
         let caption = self
-            .custom_title
-            .clone()
+            .terminal_agent_display_title(cx)
+            .map(|title| title.to_string())
             .unwrap_or_else(|| self.terminal.read(cx).title(true));
         let project_name = self.workspace.upgrade().and_then(|workspace| {
             workspace
@@ -867,7 +942,9 @@ impl TerminalView {
                     multi_workspace.activate(workspace.clone(), None, window, cx);
 
                     workspace.update(cx, |workspace, cx| {
-                        workspace.reveal_panel::<TerminalPanel>(window, cx);
+                        if workspace.activate_item(&terminal_view, true, true, window, cx) {
+                            return;
+                        }
                         if let Some(terminal_panel) = workspace.panel::<TerminalPanel>(cx) {
                             terminal_panel.update(cx, |terminal_panel, cx| {
                                 if let Some((item_index, pane, _)) = terminal_panel
@@ -880,8 +957,8 @@ impl TerminalView {
                                     );
                                 }
                             });
+                            workspace.focus_panel::<TerminalPanel>(window, cx);
                         }
-                        workspace.focus_panel::<TerminalPanel>(window, cx);
                     });
                 })
                 .log_err();
@@ -1504,6 +1581,9 @@ fn subscribe_for_terminal_events(
 
             match event {
                 Event::Wakeup => {
+                    if terminal_view.refresh_agent_restore_state(cx) {
+                        terminal_view.needs_serialize = true;
+                    }
                     cx.notify();
                     cx.emit(Event::Wakeup);
                     cx.emit(ItemEvent::UpdateTab);
@@ -1843,10 +1923,8 @@ impl Item for TerminalView {
     fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
         let terminal = self.terminal().read(cx);
         let title = self
-            .custom_title
-            .as_ref()
-            .filter(|title| !title.trim().is_empty())
-            .cloned()
+            .terminal_agent_display_title(cx)
+            .map(|title| title.to_string())
             .unwrap_or_else(|| terminal.title(true));
 
         let (icon, icon_color, rerun_button) = match terminal.task() {
@@ -1871,7 +1949,11 @@ impl Item for TerminalView {
                     }
                 }
             },
-            None => (IconName::Terminal, Color::Muted, None),
+            None => (
+                self.terminal_agent_icon().unwrap_or(IconName::Terminal),
+                Color::Muted,
+                None,
+            ),
         };
 
         let self_handle = self.self_handle.clone();
@@ -1944,8 +2026,8 @@ impl Item for TerminalView {
     }
 
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString {
-        if let Some(custom_title) = self.custom_title.as_ref().filter(|l| !l.trim().is_empty()) {
-            return custom_title.clone().into();
+        if let Some(title) = self.terminal_agent_display_title(cx) {
+            return title;
         }
         let terminal = self.terminal().read(cx);
         terminal.title(detail == 0).into()
@@ -2248,22 +2330,26 @@ impl SerializableItem for TerminalView {
         cx: &mut Context<Self>,
     ) -> Option<Task<anyhow::Result<()>>> {
         let terminal_handle = self.terminal().clone();
-        let terminal = terminal_handle.read(cx);
-        if terminal.task().is_some() {
-            return None;
-        }
+        let cwd = {
+            let terminal = terminal_handle.read(cx);
+            if terminal.task().is_some() {
+                return None;
+            }
 
-        if !self.needs_serialize && !closing {
-            return None;
-        }
+            if !self.needs_serialize && !closing {
+                return None;
+            }
+
+            terminal.working_directory()
+        };
 
         let workspace_id = self.workspace_id?;
-        let cwd = terminal.working_directory();
         let custom_title = self.custom_title.clone();
-        self.agent_tracker.refresh(terminal);
+        self.refresh_agent_restore_state(cx);
         let agent_restore_state = self
             .agent_tracker
             .restore_state()
+            .filter(|state| state.resume_input().is_some())
             .map(|state| serde_json::to_string(&state))
             .transpose()
             .log_err()
@@ -2326,6 +2412,19 @@ impl SerializableItem for TerminalView {
                         .and_then(|state| {
                             serde_json::from_str::<TerminalAgentRestoreState>(&state).log_err()
                         });
+                    let agent_restore_state = agent_restore_state.filter(|state| {
+                        if state.resume_input().is_some() {
+                            true
+                        } else {
+                            let db = TerminalDb::global(cx);
+                            cx.background_spawn(async move {
+                                db.save_agent_restore_state(item_id, workspace_id, None)
+                                    .await
+                            })
+                            .detach_and_log_err(cx);
+                            false
+                        }
+                    });
                     (cwd, custom_title, agent_restore_state)
                 })
                 .ok()

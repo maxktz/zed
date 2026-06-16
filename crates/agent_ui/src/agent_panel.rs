@@ -1,6 +1,5 @@
 use std::{
     cell::Cell,
-    fmt,
     path::PathBuf,
     rc::Rc,
     sync::{
@@ -41,7 +40,7 @@ use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
-    TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
+    TerminalId, TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
@@ -160,29 +159,6 @@ impl gpui::Global for MaxIdleRetainedThreads {}
 impl MaxIdleRetainedThreads {
     pub fn global(cx: &App) -> usize {
         cx.try_global::<Self>().map_or(5, |g| g.0)
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct TerminalId(uuid::Uuid);
-
-impl TerminalId {
-    pub(crate) fn new() -> Self {
-        Self(uuid::Uuid::new_v4())
-    }
-
-    pub(crate) fn to_key_string(self) -> String {
-        self.0.hyphenated().to_string()
-    }
-
-    pub(crate) fn from_key_string(key: &str) -> anyhow::Result<Self> {
-        Ok(Self(uuid::Uuid::parse_str(key)?))
-    }
-}
-
-impl fmt::Display for TerminalId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
     }
 }
 
@@ -2365,8 +2341,12 @@ impl AgentPanel {
     }
 
     fn persist_terminal_metadata(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
-        if let Some(terminal) = self.terminals.get(&terminal_id) {
-            terminal.view.update(cx, |terminal_view, cx| {
+        let terminal_view = self
+            .terminals
+            .get(&terminal_id)
+            .map(|terminal| terminal.view.clone());
+        if let Some(terminal_view) = terminal_view.as_ref() {
+            terminal_view.update(cx, |terminal_view, cx| {
                 terminal_view.refresh_agent_restore_state(cx);
             });
         }
@@ -2377,7 +2357,11 @@ impl AgentPanel {
             return;
         };
         store.update(cx, |store, cx| {
-            store.save(metadata, cx);
+            if let Some(terminal_view) = terminal_view {
+                store.upsert_live_terminal(&terminal_view, metadata, cx);
+            } else {
+                store.save(metadata, cx);
+            }
         });
     }
 
@@ -3176,6 +3160,13 @@ impl AgentPanel {
 
     pub fn has_terminal(&self, terminal_id: TerminalId) -> bool {
         self.terminals.contains_key(&terminal_id)
+    }
+
+    pub fn terminal_views(&self) -> Vec<(TerminalId, Entity<TerminalView>)> {
+        self.terminals
+            .iter()
+            .map(|(terminal_id, terminal)| (*terminal_id, terminal.view.clone()))
+            .collect()
     }
 
     pub fn terminals(&self, cx: &App) -> Vec<AgentPanelTerminalInfo> {
