@@ -1,6 +1,6 @@
 use core::num;
 
-use gpui::App;
+use gpui::{App, Pixels, px};
 use language::CursorShape;
 use project::project_settings::DiagnosticSeverity;
 pub use settings::{
@@ -91,9 +91,10 @@ pub struct Toolbar {
     pub code_actions: bool,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Scrollbar {
     pub show: ShowScrollbar,
+    pub size: Pixels,
     pub git_diff: bool,
     pub selected_text: bool,
     pub selected_symbol: bool,
@@ -223,6 +224,7 @@ impl Settings for EditorSettings {
             },
             scrollbar: Scrollbar {
                 show: scrollbar.show.map(ui_scrollbar_settings_from_raw).unwrap(),
+                size: px(scrollbar.size.unwrap().max(0.)),
                 git_diff: scrollbar.git_diff.unwrap()
                     && content
                         .git

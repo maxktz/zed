@@ -908,6 +908,7 @@ List of `string` values
 {
   "scrollbar": {
     "show": "auto",
+    "size": 15,
     "cursors": true,
     "git_diff": true,
     "search_results": true,
@@ -969,6 +970,16 @@ List of `string` values
   }
 }
 ```
+
+### Size
+
+- Description: Size of the scrollbar in pixels.
+- Setting: `size`
+- Default: `15`
+
+**Options**
+
+`number` values
 
 ### Cursor Indicators
 

@@ -266,6 +266,7 @@ TBD: Centered layout related settings
   "scrollbar": {
     // When to show the scrollbar in the editor (auto, system, always, never)
     "show": "auto",
+    "size": 15,               // Size of the scrollbar in pixels.
     "cursors": true,          // Show cursor positions in the scrollbar.
     "git_diff": true,         // Show git diff indicators in the scrollbar.
     "search_results": true,   // Show buffer search results in the scrollbar.

@@ -10673,7 +10673,7 @@ impl Editor {
             border: cx.theme().colors().border,
             local_player: cx.theme().players().local(),
             text: text_style,
-            scrollbar_width: EditorElement::SCROLLBAR_WIDTH,
+            scrollbar_width: EditorSettings::get_global(cx).scrollbar.size,
             syntax: cx.theme().syntax().clone(),
             status: cx.theme().status().clone(),
             inlay_hints_style: make_inlay_hints_style(cx),

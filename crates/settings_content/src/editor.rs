@@ -385,6 +385,10 @@ pub struct ScrollbarContent {
     ///
     /// Default: auto
     pub show: Option<ShowScrollbar>,
+    /// The size of the scrollbar in pixels.
+    ///
+    /// Default: 15
+    pub size: Option<f32>,
     /// Whether to show git diff indicators in the scrollbar.
     ///
     /// Default: true

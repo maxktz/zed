@@ -2224,7 +2224,7 @@ fn editor_page() -> SettingsPage {
         ]
     }
 
-    fn scrollbar_section() -> [SettingsPageItem; 10] {
+    fn scrollbar_section() -> [SettingsPageItem; 11] {
         [
             SettingsPageItem::SectionHeader("Scrollbar"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -2242,6 +2242,26 @@ fn editor_page() -> SettingsPage {
                             .scrollbar
                             .get_or_insert_default()
                             .show = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Size",
+                description: "Size of the scrollbar in pixels.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("scrollbar.size"),
+                    pick: |settings_content| {
+                        settings_content.editor.scrollbar.as_ref()?.size.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .editor
+                            .scrollbar
+                            .get_or_insert_default()
+                            .size = value.map(|value| value.max(0.));
                     },
                 }),
                 metadata: None,

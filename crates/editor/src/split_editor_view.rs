@@ -388,7 +388,7 @@ impl SplitBufferHeadersElement {
         let vertical_scrollbar_width = (scrollbars_shown
             && settings.scrollbar.axes.vertical
             && self.editor.read(cx).show_scrollbars.vertical)
-            .then_some(EditorElement::SCROLLBAR_WIDTH)
+            .then_some(settings.scrollbar.size)
             .unwrap_or_default();
         let available_width = bounds.size.width - vertical_scrollbar_width;
 
