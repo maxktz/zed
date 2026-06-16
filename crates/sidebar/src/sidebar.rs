@@ -2388,6 +2388,37 @@ impl Sidebar {
             });
     }
 
+    fn select_current_entry(&mut self) {
+        self.selection = self
+            .active_entry
+            .as_ref()
+            .and_then(|active| {
+                self.contents
+                    .entries
+                    .iter()
+                    .position(|entry| active.matches_entry(entry))
+            })
+            .or_else(|| {
+                self.contents.entries.iter().position(|entry| {
+                    matches!(
+                        entry,
+                        ListEntry::WorkspaceHeader {
+                            is_active: true,
+                            ..
+                        }
+                    )
+                })
+            });
+
+        if self.selection.is_none() {
+            self.select_first_entry();
+        }
+
+        if let Some(ix) = self.selection {
+            self.list_state.scroll_to_reveal_item(ix);
+        }
+    }
+
     fn render_list_entry(
         &mut self,
         ix: usize,
@@ -3521,8 +3552,9 @@ impl Sidebar {
             if !has_selection {
                 archive.update(cx, |view, cx| view.focus_filter_editor(window, cx));
             }
-        } else if self.selection.is_none() && self.should_show_search(window, cx) {
-            self.filter_editor.focus_handle(cx).focus(window, cx);
+        } else if self.selection.is_none() {
+            self.select_current_entry();
+            cx.notify();
         }
     }
 
@@ -3533,21 +3565,14 @@ impl Sidebar {
         }
 
         if self.filter_editor.read(cx).is_focused(window) {
-            if self.reset_filter_editor_text(window, cx) {
-                self.search_revealed = false;
-                self.selection = None;
-                self.update_entries(cx);
-                return;
-            }
-
+            let filter_cleared = self.reset_filter_editor_text(window, cx);
             self.search_revealed = false;
-            if self.selection.is_none() {
-                self.select_first_entry();
+            if filter_cleared {
+                self.update_entries(cx);
             }
-            if self.selection.is_some() {
-                self.focus_handle.focus(window, cx);
-                cx.notify();
-            }
+            self.select_current_entry();
+            self.focus_handle.focus(window, cx);
+            cx.notify();
             return;
         }
 
@@ -3556,9 +3581,6 @@ impl Sidebar {
             self.update_entries(cx);
         } else {
             self.selection = None;
-            if self.should_show_search(window, cx) {
-                self.filter_editor.focus_handle(cx).focus(window, cx);
-            }
             cx.notify();
         }
     }
@@ -3738,11 +3760,15 @@ impl Sidebar {
         cx.notify();
     }
 
-    fn select_previous(&mut self, _: &SelectPrevious, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_previous(
+        &mut self,
+        _: &SelectPrevious,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match self.selection {
             Some(0) => {
-                self.selection = None;
-                self.filter_editor.focus_handle(cx).focus(window, cx);
+                self.list_state.scroll_to_reveal_item(0);
                 cx.notify();
             }
             Some(ix) => {
@@ -6218,6 +6244,11 @@ impl Sidebar {
             .capture_action(
                 cx.listener(|this, _: &editor::actions::Newline, window, cx| {
                     this.editor_confirm(window, cx);
+                }),
+            )
+            .capture_action(
+                cx.listener(|this, _: &editor::actions::Cancel, window, cx| {
+                    this.cancel(&Cancel, window, cx);
                 }),
             )
             .child(self.filter_editor.clone())
