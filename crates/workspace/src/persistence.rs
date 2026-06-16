@@ -60,6 +60,7 @@ use self::model::{DockStructure, SerializedWorkspaceLocation, SessionWorkspace};
 // > <..> the maximum value of a host parameter number is SQLITE_MAX_VARIABLE_NUMBER,
 // > which defaults to <..> 32766 for SQLite versions after 3.32.0.
 const MAX_QUERY_PLACEHOLDERS: usize = 32000;
+const WORKSPACE_SLOTS_NAMESPACE: &str = "multi_workspace_workspace_slots";
 
 fn parse_timestamp(text: &str) -> DateTime<Utc> {
     NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
@@ -322,6 +323,132 @@ pub async fn write_multi_workspace_state(
             .await
             .log_err();
     }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct SerializedWorkspaceSlots {
+    #[serde(default)]
+    slots: Vec<model::SerializedWorkspaceSlot>,
+}
+
+fn workspace_slots_key(group_key: &ProjectGroupKey) -> Option<String> {
+    if group_key.path_list().paths().is_empty() {
+        return None;
+    }
+
+    serde_json::to_string(&model::SerializedProjectGroup::from_group(group_key, true)).log_err()
+}
+
+fn normalize_workspace_slots(
+    slots: Vec<model::SerializedWorkspaceSlot>,
+) -> Vec<model::SerializedWorkspaceSlot> {
+    let mut seen = HashSet::default();
+    let mut normalized = Vec::new();
+
+    for slot in slots {
+        let path_list = slot.path_list();
+        if path_list.paths().is_empty() || !seen.insert(path_list.clone()) {
+            continue;
+        }
+        normalized.push(model::SerializedWorkspaceSlot::from_path_list_with_label(
+            &path_list, slot.label,
+        ));
+    }
+
+    normalized
+}
+
+fn read_workspace_slots_from_kvp(
+    kvp: &KeyValueStore,
+    group_key: &ProjectGroupKey,
+) -> Vec<model::SerializedWorkspaceSlot> {
+    let Some(key) = workspace_slots_key(group_key) else {
+        return Vec::new();
+    };
+
+    let Some(json) = kvp
+        .scoped(WORKSPACE_SLOTS_NAMESPACE)
+        .read(&key)
+        .log_err()
+        .flatten()
+    else {
+        return Vec::new();
+    };
+
+    let slots = serde_json::from_str::<SerializedWorkspaceSlots>(&json)
+        .map(|payload| payload.slots)
+        .or_else(|_| serde_json::from_str::<Vec<model::SerializedWorkspaceSlot>>(&json))
+        .log_err()
+        .unwrap_or_default();
+
+    normalize_workspace_slots(slots)
+}
+
+pub fn read_workspace_slots_for_project_group(
+    group_key: &ProjectGroupKey,
+    cx: &App,
+) -> Vec<model::SerializedWorkspaceSlot> {
+    let kvp = KeyValueStore::global(cx);
+    read_workspace_slots_from_kvp(&kvp, group_key)
+}
+
+async fn write_workspace_slots_for_project_group(
+    kvp: &KeyValueStore,
+    group_key: &ProjectGroupKey,
+    slots: Vec<model::SerializedWorkspaceSlot>,
+) {
+    let Some(key) = workspace_slots_key(group_key) else {
+        return;
+    };
+
+    let slots = normalize_workspace_slots(slots);
+    let scope = kvp.scoped(WORKSPACE_SLOTS_NAMESPACE);
+    if slots.is_empty() {
+        scope.delete(key).await.log_err();
+        return;
+    }
+
+    let payload = SerializedWorkspaceSlots { slots };
+    if let Some(json) = serde_json::to_string(&payload).log_err() {
+        scope.write(key, json).await.log_err();
+    }
+}
+
+pub async fn upsert_workspace_slot_for_project_group(
+    kvp: &KeyValueStore,
+    group_key: ProjectGroupKey,
+    path_list: PathList,
+    label: Option<String>,
+) {
+    if group_key.path_list().paths().is_empty() || path_list.paths().is_empty() {
+        return;
+    }
+
+    let mut slots = read_workspace_slots_from_kvp(kvp, &group_key);
+    if let Some(slot) = slots.iter_mut().find(|slot| slot.path_list() == path_list) {
+        if label.is_some() {
+            slot.label = label;
+        }
+    } else {
+        slots.push(model::SerializedWorkspaceSlot::from_path_list_with_label(
+            &path_list, label,
+        ));
+    }
+    write_workspace_slots_for_project_group(kvp, &group_key, slots).await;
+}
+
+pub async fn remove_workspace_slot_for_project_group(
+    kvp: &KeyValueStore,
+    group_key: ProjectGroupKey,
+    path_list: PathList,
+) {
+    if group_key.path_list().paths().is_empty() || path_list.paths().is_empty() {
+        return;
+    }
+
+    let mut slots = read_workspace_slots_from_kvp(kvp, &group_key);
+    slots.retain(|slot| slot.path_list() != path_list);
+    write_workspace_slots_for_project_group(kvp, &group_key, slots).await;
 }
 
 pub fn read_serialized_multi_workspaces(

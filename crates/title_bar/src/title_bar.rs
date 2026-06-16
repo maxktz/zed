@@ -64,6 +64,22 @@ const MAX_PROJECT_NAME_LENGTH: usize = 40;
 const MAX_BRANCH_NAME_LENGTH: usize = 40;
 const MAX_SHORT_SHA_LENGTH: usize = 8;
 
+fn workspace_slot_title_label(path_list: &util::path_list::PathList) -> SharedString {
+    let names = path_list
+        .ordered_paths()
+        .filter_map(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .collect::<Vec<_>>();
+
+    if names.is_empty() {
+        "workspace".into()
+    } else {
+        names.join(", ").into()
+    }
+}
+
 actions!(
     collab,
     [
@@ -462,6 +478,9 @@ impl TitleBar {
                 cx.notify()
             }),
         );
+        if let Some(multi_workspace) = multi_workspace.as_ref().and_then(|mw| mw.upgrade()) {
+            subscriptions.push(cx.observe(&multi_workspace, |_, _, cx| cx.notify()));
+        }
 
         subscriptions.push(cx.observe(&active_call, |this, _, cx| this.active_call_changed(cx)));
         subscriptions.push(cx.observe_window_activation(window, Self::window_activation_changed));
@@ -947,7 +966,22 @@ impl TitleBar {
                 (creation.label.clone(), creation.is_switch)
             })
             .unwrap_or((None, false));
-        let is_creating = creation_in_progress.is_some();
+
+        let shared_opening_label = if creation_in_progress.is_none() {
+            self.multi_workspace
+                .as_ref()
+                .and_then(|mw| mw.upgrade())
+                .and_then(|mw| {
+                    mw.read(cx)
+                        .opening_workspace_slots()
+                        .into_iter()
+                        .next()
+                        .map(|slot_id| workspace_slot_title_label(slot_id.path_list()))
+                })
+        } else {
+            None
+        };
+        let is_creating = creation_in_progress.is_some() || shared_opening_label.is_some();
 
         let display_label: SharedString = if let Some(ref name) = creation_in_progress {
             if is_switch {
@@ -955,6 +989,8 @@ impl TitleBar {
             } else {
                 format!("Creating {}…", name).into()
             }
+        } else if let Some(ref name) = shared_opening_label {
+            format!("Loading {}…", name).into()
         } else {
             worktree_label.clone()
         };

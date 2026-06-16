@@ -35,7 +35,7 @@ pub use multi_workspace::{
     MultiWorkspace, MultiWorkspaceEvent, NewThread, NextProject, NextThread, PreviousProject,
     PreviousThread, ProjectGroup, ProjectGroupKey, SerializedProjectGroupState, Sidebar,
     SidebarEvent, SidebarHandle, SidebarRenderState, SidebarSide, ToggleWorkspaceSidebar,
-    sidebar_side_context_menu,
+    WorkspaceSlotId, sidebar_side_context_menu,
 };
 pub use path_list::{PathList, SerializedPathList};
 pub use remote::{
@@ -89,9 +89,10 @@ pub use persistence::{
     RecentWorkspace, WorkspaceDb, delete_unloaded_items,
     model::{
         DockData, DockStructure, ItemId, MultiWorkspaceState, SerializedMultiWorkspace,
-        SerializedProjectGroup, SerializedWorkspaceLocation, SessionWorkspace,
+        SerializedProjectGroup, SerializedWorkspaceLocation, SerializedWorkspaceSlot,
+        SessionWorkspace,
     },
-    read_serialized_multi_workspaces,
+    read_serialized_multi_workspaces, read_workspace_slots_for_project_group,
 };
 use persistence::{SerializedWindowBounds, model::SerializedWorkspace};
 use postage::stream::Stream;

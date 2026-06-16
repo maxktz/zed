@@ -105,6 +105,30 @@ impl From<SerializedProjectGroup> for ProjectGroupKey {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SerializedWorkspaceSlot {
+    pub path_list: SerializedPathList,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+impl SerializedWorkspaceSlot {
+    pub fn from_path_list(path_list: &PathList) -> Self {
+        Self::from_path_list_with_label(path_list, None)
+    }
+
+    pub fn from_path_list_with_label(path_list: &PathList, label: Option<String>) -> Self {
+        Self {
+            path_list: path_list.serialize(),
+            label,
+        }
+    }
+
+    pub fn path_list(&self) -> PathList {
+        PathList::deserialize(&self.path_list)
+    }
+}
+
 /// Per-window state for a MultiWorkspace, persisted to KVP.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MultiWorkspaceState {

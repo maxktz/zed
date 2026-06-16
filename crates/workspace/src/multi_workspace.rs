@@ -12,6 +12,7 @@ use remote::RemoteConnectionOptions;
 use settings::Settings;
 pub use settings::SidebarSide;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -295,6 +296,29 @@ pub struct ProjectGroupState {
     pub last_active_workspace: Option<WeakEntity<Workspace>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct WorkspaceSlotId {
+    project_group_key: ProjectGroupKey,
+    path_list: PathList,
+}
+
+impl WorkspaceSlotId {
+    pub fn new(project_group_key: ProjectGroupKey, path_list: PathList) -> Self {
+        Self {
+            project_group_key,
+            path_list,
+        }
+    }
+
+    pub fn project_group_key(&self) -> &ProjectGroupKey {
+        &self.project_group_key
+    }
+
+    pub fn path_list(&self) -> &PathList {
+        &self.path_list
+    }
+}
+
 pub struct MultiWorkspace {
     window_id: WindowId,
     retained_workspaces: Vec<Entity<Workspace>>,
@@ -311,6 +335,8 @@ pub struct MultiWorkspace {
     sidebar_open: bool,
     sidebar_overlay: Option<AnyView>,
     pending_removal_tasks: Vec<Task<()>>,
+    pending_workspace_slot_task: Option<Task<()>>,
+    opening_workspace_slots: HashMap<WorkspaceSlotId, usize>,
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     previous_focus_handle: Option<FocusHandle>,
@@ -338,6 +364,9 @@ impl MultiWorkspace {
                 task.detach();
             }
             for task in std::mem::take(&mut this.pending_removal_tasks) {
+                task.detach();
+            }
+            if let Some(task) = this.pending_workspace_slot_task.take() {
                 task.detach();
             }
         });
@@ -370,6 +399,8 @@ impl MultiWorkspace {
             sidebar_open: false,
             sidebar_overlay: None,
             pending_removal_tasks: Vec::new(),
+            pending_workspace_slot_task: None,
+            opening_workspace_slots: HashMap::new(),
             _serialize_task: None,
             _subscriptions: vec![
                 release_subscription,
@@ -600,6 +631,54 @@ impl MultiWorkspace {
         })
         .detach();
 
+        let initial_scan = project.read(cx).wait_for_initial_scan(cx);
+        cx.spawn({
+            let workspace = workspace.downgrade();
+            async move |this, cx| {
+                initial_scan.await;
+                this.update(cx, |this, cx| {
+                    let Some(workspace) = workspace.upgrade() else {
+                        return;
+                    };
+                    let Some(label) = Self::workspace_slot_branch_label(&workspace, cx) else {
+                        return;
+                    };
+
+                    let key = workspace.read(cx).project_group_key(cx);
+                    let path_list = PathList::new(&workspace.read(cx).root_paths(cx));
+                    this.persist_workspace_slot(key, path_list, Some(label), cx);
+                    cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+                })
+                .ok();
+            }
+        })
+        .detach();
+
+        let git_store = workspace.read(cx).project().read(cx).git_store().clone();
+        cx.subscribe_in(&git_store, window, {
+            let workspace = workspace.downgrade();
+            move |this, _git_store, event: &project::git_store::GitStoreEvent, _window, cx| {
+                if !matches!(
+                    event,
+                    project::git_store::GitStoreEvent::RepositoryUpdated(
+                        _,
+                        project::git_store::RepositoryEvent::HeadChanged,
+                        _,
+                    )
+                ) {
+                    return;
+                }
+
+                let Some(workspace) = workspace.upgrade() else {
+                    return;
+                };
+                let key = workspace.read(cx).project_group_key(cx);
+                this.persist_workspace_slot_for_workspace(&workspace, key, cx);
+                cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+            }
+        })
+        .detach();
+
         cx.subscribe_in(workspace, window, |this, workspace, event, window, cx| {
             if let WorkspaceEvent::Activate = event {
                 this.activate(workspace.clone(), None, window, cx);
@@ -623,6 +702,29 @@ impl MultiWorkspace {
             return;
         }
 
+        let path_list = PathList::new(&workspace.read(cx).root_paths(cx));
+        let label = Self::workspace_slot_branch_label(workspace, cx);
+        let kvp = db::kvp::KeyValueStore::global(cx);
+        self.enqueue_workspace_slot_write(
+            {
+                let old_key = old_key.clone();
+                let new_key = new_key.clone();
+                async move {
+                    crate::persistence::remove_workspace_slot_for_project_group(
+                        &kvp,
+                        old_key,
+                        path_list.clone(),
+                    )
+                    .await;
+                    crate::persistence::upsert_workspace_slot_for_project_group(
+                        &kvp, new_key, path_list, label,
+                    )
+                    .await;
+                }
+            },
+            cx,
+        );
+
         // The Project already emitted WorktreePathsChanged which the
         // sidebar handles for thread migration.
         self.rekey_project_group(old_key, &new_key, cx);
@@ -642,6 +744,178 @@ impl MultiWorkspace {
 
     pub fn retained_workspaces(&self) -> &[Entity<Workspace>] {
         &self.retained_workspaces
+    }
+
+    pub fn is_workspace_slot_opening(&self, slot_id: &WorkspaceSlotId) -> bool {
+        self.opening_workspace_slots.contains_key(slot_id)
+    }
+
+    pub fn opening_workspace_slots_for_project_group(
+        &self,
+        project_group_key: &ProjectGroupKey,
+    ) -> Vec<WorkspaceSlotId> {
+        self.opening_workspace_slots
+            .keys()
+            .filter(|slot_id| slot_id.project_group_key() == project_group_key)
+            .cloned()
+            .collect()
+    }
+
+    pub fn opening_workspace_slots(&self) -> Vec<WorkspaceSlotId> {
+        self.opening_workspace_slots.keys().cloned().collect()
+    }
+
+    pub fn start_workspace_slot_operation(
+        &mut self,
+        slot_id: WorkspaceSlotId,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_workspace_slot_opening(slot_id, true, cx);
+    }
+
+    pub fn finish_workspace_slot_operation(
+        &mut self,
+        slot_id: WorkspaceSlotId,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_workspace_slot_opening(slot_id, false, cx);
+    }
+
+    fn workspace_slot_id_for_paths(
+        path_list: &PathList,
+        host: Option<RemoteConnectionOptions>,
+        project_group: Option<&ProjectGroupKey>,
+    ) -> WorkspaceSlotId {
+        WorkspaceSlotId::new(
+            project_group
+                .cloned()
+                .unwrap_or_else(|| ProjectGroupKey::new(host, path_list.clone())),
+            path_list.clone(),
+        )
+    }
+
+    fn set_workspace_slot_opening(
+        &mut self,
+        slot_id: WorkspaceSlotId,
+        opening: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = if opening {
+            let count = self.opening_workspace_slots.entry(slot_id).or_default();
+            let changed = *count == 0;
+            *count += 1;
+            changed
+        } else if let Some(count) = self.opening_workspace_slots.get_mut(&slot_id) {
+            if *count > 1 {
+                *count -= 1;
+                false
+            } else {
+                self.opening_workspace_slots.remove(&slot_id);
+                true
+            }
+        } else {
+            false
+        };
+
+        if changed {
+            cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+            cx.notify();
+        }
+    }
+
+    fn enqueue_workspace_slot_write(
+        &mut self,
+        write: impl Future<Output = ()> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_write = self
+            .pending_workspace_slot_task
+            .take()
+            .unwrap_or(Task::ready(()));
+        self.pending_workspace_slot_task = Some(cx.background_spawn(async move {
+            previous_write.await;
+            write.await;
+        }));
+    }
+
+    fn persist_workspace_slot(
+        &mut self,
+        group_key: ProjectGroupKey,
+        path_list: PathList,
+        label: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if group_key.path_list().paths().is_empty() || path_list.paths().is_empty() {
+            return;
+        }
+
+        let kvp = db::kvp::KeyValueStore::global(cx);
+        self.enqueue_workspace_slot_write(
+            async move {
+                crate::persistence::upsert_workspace_slot_for_project_group(
+                    &kvp, group_key, path_list, label,
+                )
+                .await;
+            },
+            cx,
+        );
+    }
+
+    fn workspace_slot_branch_label(workspace: &Entity<Workspace>, cx: &App) -> Option<String> {
+        let root_paths = workspace.read(cx).root_paths(cx);
+        if root_paths.is_empty() {
+            return None;
+        }
+
+        let project = workspace.read(cx).project().clone();
+        let repository_snapshots = project
+            .read(cx)
+            .repositories(cx)
+            .values()
+            .map(|repo| repo.read(cx).snapshot())
+            .collect::<Vec<_>>();
+
+        let mut labels = Vec::with_capacity(root_paths.len());
+        for root_path in root_paths {
+            let snapshot = repository_snapshots
+                .iter()
+                .find(|snapshot| snapshot.work_directory_abs_path.as_ref() == root_path.as_ref())?;
+            let branch = snapshot.branch.as_ref()?;
+            labels.push(branch.name().to_string());
+        }
+
+        Some(labels.join(", "))
+    }
+
+    fn persist_workspace_slot_for_workspace(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        group_key: ProjectGroupKey,
+        cx: &mut Context<Self>,
+    ) {
+        let path_list = PathList::new(&workspace.read(cx).root_paths(cx));
+        let label = Self::workspace_slot_branch_label(workspace, cx);
+        self.persist_workspace_slot(group_key, path_list, label, cx);
+    }
+
+    pub fn remove_workspace_slot(
+        &mut self,
+        group_key: ProjectGroupKey,
+        path_list: PathList,
+        cx: &mut Context<Self>,
+    ) {
+        let kvp = db::kvp::KeyValueStore::global(cx);
+        cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+        cx.notify();
+        self.enqueue_workspace_slot_write(
+            async move {
+                crate::persistence::remove_workspace_slot_for_project_group(
+                    &kvp, group_key, path_list,
+                )
+                .await;
+            },
+            cx,
+        );
     }
 
     /// Ensures a project group exists for `key`, creating one if needed.
@@ -729,7 +1003,8 @@ impl MultiWorkspace {
         key: ProjectGroupKey,
         cx: &mut Context<Self>,
     ) {
-        self.ensure_project_group_state(key);
+        self.ensure_project_group_state(key.clone());
+        self.persist_workspace_slot_for_workspace(&workspace, key, cx);
         if self.is_workspace_retained(&workspace) {
             return;
         }
@@ -754,6 +1029,8 @@ impl MultiWorkspace {
             self.retained_workspaces.push(workspace.clone());
         }
 
+        let key = workspace.read(cx).project_group_key(cx);
+        self.persist_workspace_slot_for_workspace(&workspace, key, cx);
         self.activate(workspace.clone(), None, window, cx);
         cx.emit(MultiWorkspaceEvent::WorkspaceAdded(workspace));
     }
@@ -1253,76 +1530,94 @@ impl MultiWorkspace {
             );
         };
 
+        let opening_slot_id = Self::workspace_slot_id_for_paths(
+            &paths,
+            Some(connection_options.clone()),
+            provisional_project_group_key.as_ref(),
+        );
+        self.set_workspace_slot_opening(opening_slot_id.clone(), true, cx);
+
         let app_state = self.workspace().read(cx).app_state().clone();
         let window_handle = window.window_handle().downcast::<MultiWorkspace>();
         let connect_task = connect_remote(connection_options.clone(), window, cx);
         let paths_vec = paths.paths().to_vec();
 
         cx.spawn(async move |_this, cx| {
-            let session = connect_task
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("Remote connection was cancelled"))?;
+            let result = async {
+                let session = connect_task
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Remote connection was cancelled"))?;
 
-            let new_project = cx.update(|cx| {
-                Project::remote(
-                    session,
-                    app_state.client.clone(),
-                    app_state.node_runtime.clone(),
-                    app_state.user_store.clone(),
-                    app_state.languages.clone(),
-                    app_state.fs.clone(),
-                    true,
-                    cx,
-                )
-            });
+                let new_project = cx.update(|cx| {
+                    Project::remote(
+                        session,
+                        app_state.client.clone(),
+                        app_state.node_runtime.clone(),
+                        app_state.user_store.clone(),
+                        app_state.languages.clone(),
+                        app_state.fs.clone(),
+                        true,
+                        cx,
+                    )
+                });
 
-            let effective_paths_vec =
-                if let Some(project_group) = provisional_project_group_key.as_ref() {
-                    let resolve_tasks = cx.update(|cx| {
-                        let project = new_project.read(cx);
-                        paths_vec
-                            .iter()
-                            .map(|path| project.resolve_abs_path(&path.to_string_lossy(), cx))
-                            .collect::<Vec<_>>()
-                    });
-                    let resolved = futures::future::join_all(resolve_tasks).await;
-                    // `resolve_abs_path` returns `None` for both "definitely
-                    // absent" and transport errors (it swallows the error via
-                    // `log_err`). This is a weaker guarantee than the local
-                    // `Ok(None)` check, but it matches how the rest of the
-                    // codebase consumes this API.
-                    let all_paths_missing =
-                        !paths_vec.is_empty() && resolved.iter().all(|resolved| resolved.is_none());
+                let effective_paths_vec =
+                    if let Some(project_group) = provisional_project_group_key.as_ref() {
+                        let resolve_tasks = cx.update(|cx| {
+                            let project = new_project.read(cx);
+                            paths_vec
+                                .iter()
+                                .map(|path| project.resolve_abs_path(&path.to_string_lossy(), cx))
+                                .collect::<Vec<_>>()
+                        });
+                        let resolved = futures::future::join_all(resolve_tasks).await;
+                        // `resolve_abs_path` returns `None` for both "definitely
+                        // absent" and transport errors (it swallows the error via
+                        // `log_err`). This is a weaker guarantee than the local
+                        // `Ok(None)` check, but it matches how the rest of the
+                        // codebase consumes this API.
+                        let all_paths_missing = !paths_vec.is_empty()
+                            && resolved.iter().all(|resolved| resolved.is_none());
 
-                    if all_paths_missing {
-                        project_group.path_list().paths().to_vec()
+                        if all_paths_missing {
+                            project_group.path_list().paths().to_vec()
+                        } else {
+                            paths_vec
+                        }
                     } else {
                         paths_vec
-                    }
-                } else {
-                    paths_vec
-                };
+                    };
 
-            let window_handle =
-                window_handle.ok_or_else(|| anyhow::anyhow!("Window is not a MultiWorkspace"))?;
+                let window_handle = window_handle
+                    .ok_or_else(|| anyhow::anyhow!("Window is not a MultiWorkspace"))?;
 
-            open_remote_project_with_existing_connection(
-                connection_options,
-                new_project,
-                effective_paths_vec,
-                app_state,
-                window_handle,
-                provisional_project_group_key,
-                source_workspace,
-                cx,
-            )
-            .await?;
+                open_remote_project_with_existing_connection(
+                    connection_options,
+                    new_project,
+                    effective_paths_vec,
+                    app_state,
+                    window_handle,
+                    provisional_project_group_key,
+                    source_workspace,
+                    cx,
+                )
+                .await?;
 
-            window_handle.update(cx, |multi_workspace, window, cx| {
-                let workspace = multi_workspace.workspace().clone();
-                multi_workspace.add(workspace.clone(), window, cx);
-                workspace
-            })
+                window_handle.update(cx, |multi_workspace, window, cx| {
+                    let workspace = multi_workspace.workspace().clone();
+                    multi_workspace.add(workspace.clone(), window, cx);
+                    workspace
+                })
+            }
+            .await;
+
+            _this
+                .update(cx, |this, cx| {
+                    this.set_workspace_slot_opening(opening_slot_id, false, cx);
+                })
+                .ok();
+
+            result
         })
     }
 
@@ -1372,6 +1667,10 @@ impl MultiWorkspace {
             return Task::ready(Ok(workspace));
         }
 
+        let opening_slot_id =
+            Self::workspace_slot_id_for_paths(&path_list, None, project_group.as_ref());
+        self.set_workspace_slot_opening(opening_slot_id.clone(), true, cx);
+
         let paths = path_list.paths().to_vec();
         let app_state = self.workspace().read(cx).app_state().clone();
         let requesting_window = window.window_handle().downcast::<MultiWorkspace>();
@@ -1379,68 +1678,79 @@ impl MultiWorkspace {
         let excluding = excluding.to_vec();
 
         cx.spawn(async move |_this, cx| {
-            let effective_path_list = if let Some(project_group) = project_group {
-                let metadata_tasks: Vec<_> = paths
-                    .iter()
-                    .map(|path| fs.metadata(path.as_path()))
-                    .collect();
-                let metadata_results = futures::future::join_all(metadata_tasks).await;
-                // Only fall back when every path is definitely absent; real
-                // filesystem errors should not be treated as "missing".
-                let all_paths_missing = !paths.is_empty()
-                    && metadata_results
-                        .into_iter()
-                        // Ok(None) means the path is definitely absent
-                        .all(|result| matches!(result, Ok(None)));
+            let result = async {
+                let effective_path_list = if let Some(project_group) = project_group {
+                    let metadata_tasks: Vec<_> = paths
+                        .iter()
+                        .map(|path| fs.metadata(path.as_path()))
+                        .collect();
+                    let metadata_results = futures::future::join_all(metadata_tasks).await;
+                    // Only fall back when every path is definitely absent; real
+                    // filesystem errors should not be treated as "missing".
+                    let all_paths_missing = !paths.is_empty()
+                        && metadata_results
+                            .into_iter()
+                            // Ok(None) means the path is definitely absent
+                            .all(|result| matches!(result, Ok(None)));
 
-                if all_paths_missing {
-                    project_group.path_list().clone()
+                    if all_paths_missing {
+                        project_group.path_list().clone()
+                    } else {
+                        PathList::new(&paths)
+                    }
                 } else {
                     PathList::new(&paths)
-                }
-            } else {
-                PathList::new(&paths)
-            };
+                };
 
-            if let Some(requesting_window) = requesting_window
-                && let Some(workspace) = requesting_window
-                    .update(cx, |multi_workspace, window, cx| {
-                        multi_workspace
-                            .workspace_for_paths_excluding(
-                                &effective_path_list,
-                                None,
-                                &excluding,
-                                cx,
-                            )
-                            .inspect(|workspace| {
-                                multi_workspace.activate(
-                                    workspace.clone(),
-                                    source_workspace.clone(),
-                                    window,
+                if let Some(requesting_window) = requesting_window
+                    && let Some(workspace) = requesting_window
+                        .update(cx, |multi_workspace, window, cx| {
+                            multi_workspace
+                                .workspace_for_paths_excluding(
+                                    &effective_path_list,
+                                    None,
+                                    &excluding,
                                     cx,
-                                );
-                            })
-                    })
-                    .ok()
-                    .flatten()
-            {
-                return Ok(workspace);
-            }
+                                )
+                                .inspect(|workspace| {
+                                    multi_workspace.activate(
+                                        workspace.clone(),
+                                        source_workspace.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })
+                        })
+                        .ok()
+                        .flatten()
+                {
+                    return Ok(workspace);
+                }
 
-            let result = cx
-                .update(|cx| {
-                    Workspace::new_local(
-                        effective_path_list.paths().to_vec(),
-                        app_state,
-                        requesting_window,
-                        None,
-                        init,
-                        open_mode,
-                        cx,
-                    )
+                let result = cx
+                    .update(|cx| {
+                        Workspace::new_local(
+                            effective_path_list.paths().to_vec(),
+                            app_state,
+                            requesting_window,
+                            None,
+                            init,
+                            open_mode,
+                            cx,
+                        )
+                    })
+                    .await?;
+                Ok(result.workspace)
+            }
+            .await;
+
+            _this
+                .update(cx, |this, cx| {
+                    this.set_workspace_slot_opening(opening_slot_id, false, cx);
                 })
-                .await?;
-            Ok(result.workspace)
+                .ok();
+
+            result
         })
     }
 
@@ -1683,6 +1993,9 @@ impl MultiWorkspace {
             tasks.push(task);
         }
         tasks.extend(std::mem::take(&mut self.pending_removal_tasks));
+        if let Some(task) = self.pending_workspace_slot_task.take() {
+            tasks.push(task);
+        }
 
         async move {
             futures::future::join_all(tasks).await;
