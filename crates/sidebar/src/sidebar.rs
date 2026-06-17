@@ -392,6 +392,29 @@ impl WorkspaceShortcutChat {
             Self::Terminal { metadata, .. } => active_terminal_id == Some(metadata.terminal_id),
         }
     }
+
+    fn matches_active_entry(&self, active_entry: &ActiveEntry) -> bool {
+        match (self, active_entry) {
+            (
+                Self::Thread { metadata, .. },
+                ActiveEntry::Thread {
+                    thread_id,
+                    session_id,
+                    ..
+                },
+            ) => {
+                *thread_id == metadata.thread_id
+                    || session_id
+                        .as_ref()
+                        .zip(metadata.session_id.as_ref())
+                        .is_some_and(|(active, metadata)| active == metadata)
+            }
+            (Self::Terminal { metadata, .. }, ActiveEntry::Terminal { terminal_id, .. }) => {
+                *terminal_id == metadata.terminal_id
+            }
+            _ => false,
+        }
+    }
 }
 
 impl ThreadEntry {
@@ -7252,6 +7275,18 @@ impl Sidebar {
         cx: &App,
     ) -> Option<usize> {
         let workspace = target.workspace.as_ref()?;
+        if let Some(active_entry) = self
+            .active_entry
+            .as_ref()
+            .filter(|active| active.workspace() == workspace)
+            && let Some(position) = target
+                .chats
+                .iter()
+                .position(|chat| chat.matches_active_entry(active_entry))
+        {
+            return Some(position);
+        }
+
         let panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
         let panel = panel.read(cx);
         let active_thread_id = panel.active_thread_id(cx);
