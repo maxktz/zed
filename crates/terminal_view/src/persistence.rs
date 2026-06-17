@@ -416,6 +416,9 @@ impl Domain for TerminalDb {
         sql! (
             ALTER TABLE terminals ADD COLUMN codex_restore_state TEXT;
         ),
+        sql! (
+            ALTER TABLE terminals ADD COLUMN output_snapshot BLOB;
+        ),
     ];
 }
 
@@ -534,6 +537,41 @@ impl TerminalDb {
         pub fn get_agent_restore_state(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<String>> {
             SELECT codex_restore_state
             FROM terminals
+            WHERE item_id = ? AND workspace_id = ?
+        }
+    }
+
+    pub async fn save_output_snapshot(
+        &self,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+        output_snapshot: Option<Vec<u8>>,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            let query = "INSERT INTO terminals (item_id, workspace_id, output_snapshot)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT (workspace_id, item_id) DO UPDATE SET
+                    output_snapshot = excluded.output_snapshot";
+            let mut statement = Statement::prepare(conn, query)?;
+            let mut next_index = statement.bind(&item_id, 1)?;
+            next_index = statement.bind(&workspace_id, next_index)?;
+            statement.bind(&output_snapshot, next_index)?;
+            statement.exec()
+        })
+        .await
+    }
+
+    query! {
+        pub fn get_output_snapshot(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<Vec<u8>>> {
+            SELECT output_snapshot
+            FROM terminals
+            WHERE item_id = ? AND workspace_id = ?
+        }
+    }
+
+    query! {
+        pub async fn delete_terminal(item_id: ItemId, workspace_id: WorkspaceId) -> Result<()> {
+            DELETE FROM terminals
             WHERE item_id = ? AND workspace_id = ?
         }
     }

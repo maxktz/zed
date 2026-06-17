@@ -5,10 +5,10 @@ pub mod terminal_panel;
 mod terminal_path_like_target;
 pub mod terminal_scrollbar;
 
+use terminal_agents::TerminalAgentTracker;
 pub use terminal_agents::{
     TerminalAgentActivity, TerminalAgentKind, TerminalAgentRestoreState, TerminalAgentTitle,
 };
-use terminal_agents::TerminalAgentTracker;
 
 use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,
@@ -38,13 +38,14 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use task::TaskId;
 use terminal::{
-    Clear, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, Paste, PasteText, Point, Range,
-    ScrollLineDown, ScrollLineUp, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop,
-    Search, ShowCharacterPalette, TaskState, TaskStatus, Terminal, TerminalBounds, ToggleViMode,
+    Clear, Copy, Event, HoveredWord, MaybeNavigationTarget, Modes, OUTPUT_RESTORED_MARKER_BYTES,
+    Paste, PasteText, Point, Range, ScrollLineDown, ScrollLineUp, ScrollPageDown, ScrollPageUp,
+    ScrollToBottom, ScrollToTop, Search, ShowCharacterPalette, TaskState, TaskStatus, Terminal,
+    TerminalBounds, ToggleViMode,
     terminal_settings::{CursorShape, TerminalSettings},
 };
 use terminal_element::TerminalElement;
@@ -85,6 +86,7 @@ fn viewport_line_for_point(point: Point, display_offset: usize) -> Option<usize>
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const OUTPUT_SNAPSHOT_SERIALIZATION_INTERVAL: Duration = Duration::from_millis(500);
 
 type TerminalAgentNotificationActivationHandler =
     Rc<dyn Fn(&mut TerminalView, &mut Window, &mut Context<TerminalView>)>;
@@ -361,6 +363,7 @@ pub struct TerminalView {
     agent_notifications_enabled: bool,
     agent_tracker: TerminalAgentTracker,
     last_agent_title: Option<SharedString>,
+    last_output_snapshot_serialization_request: Option<Instant>,
     _agent_state_watcher: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
@@ -539,6 +542,7 @@ impl TerminalView {
             agent_notifications_enabled: true,
             agent_tracker: TerminalAgentTracker::default(),
             last_agent_title: None,
+            last_output_snapshot_serialization_request: None,
             _agent_state_watcher: agent_state_watcher,
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
@@ -814,6 +818,34 @@ impl TerminalView {
             terminal.input(resume_input);
         });
         true
+    }
+
+    fn restore_output_snapshot(
+        &mut self,
+        output_snapshot: Option<Vec<u8>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(output_snapshot) = output_snapshot.filter(|snapshot| !snapshot.is_empty()) else {
+            return;
+        };
+
+        let terminal = self.terminal.clone();
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(&output_snapshot, cx);
+            terminal.write_output(OUTPUT_RESTORED_MARKER_BYTES, cx);
+        });
+    }
+
+    fn mark_output_snapshot_needs_serialize(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_output_snapshot_serialization_request
+            .is_some_and(|last| now.duration_since(last) < OUTPUT_SNAPSHOT_SERIALIZATION_INTERVAL)
+        {
+            return;
+        }
+        self.last_output_snapshot_serialization_request = Some(now);
+        self.needs_serialize = true;
     }
 
     fn notify_if_agent_needs_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1573,6 +1605,7 @@ fn subscribe_for_terminal_events(
         terminal,
         window,
         move |terminal_view, terminal, event, window, cx| {
+            let is_task_terminal = terminal.read(cx).task().is_some();
             let current_cwd = terminal.read(cx).working_directory();
             if current_cwd != previous_cwd {
                 previous_cwd = current_cwd;
@@ -1581,6 +1614,9 @@ fn subscribe_for_terminal_events(
 
             match event {
                 Event::Wakeup => {
+                    if !is_task_terminal {
+                        terminal_view.mark_output_snapshot_needs_serialize();
+                    }
                     if terminal_view.refresh_agent_restore_state(cx) {
                         terminal_view.needs_serialize = true;
                     }
@@ -1898,6 +1934,28 @@ impl Render for TerminalView {
 
 impl Item for TerminalView {
     type Event = ItemEvent;
+
+    fn on_removed(&self, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.workspace_id else {
+            return;
+        };
+        let workspace = self.workspace.clone();
+        let terminal_view = self.self_handle.clone();
+        let item_id = terminal_view.entity_id().as_u64() as workspace::ItemId;
+
+        cx.defer(move |cx| {
+            if let Some(workspace) = workspace.upgrade()
+                && let Some(terminal_view) = terminal_view.upgrade()
+                && workspace.read(cx).pane_for(&terminal_view).is_some()
+            {
+                return;
+            }
+
+            let db = TerminalDb::global(cx);
+            cx.background_spawn(async move { db.delete_terminal(item_id, workspace_id).await })
+                .detach_and_log_err(cx);
+        });
+    }
 
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {
         Some(TabTooltipContent::Custom(Box::new(Tooltip::element({
@@ -2330,7 +2388,7 @@ impl SerializableItem for TerminalView {
         cx: &mut Context<Self>,
     ) -> Option<Task<anyhow::Result<()>>> {
         let terminal_handle = self.terminal().clone();
-        let cwd = {
+        let (cwd, output_snapshot) = {
             let terminal = terminal_handle.read(cx);
             if terminal.task().is_some() {
                 return None;
@@ -2340,7 +2398,11 @@ impl SerializableItem for TerminalView {
                 return None;
             }
 
-            terminal.working_directory()
+            let output_snapshot = terminal.output_snapshot();
+            (
+                terminal.working_directory(),
+                (!output_snapshot.is_empty()).then_some(output_snapshot),
+            )
         };
 
         let workspace_id = self.workspace_id?;
@@ -2366,6 +2428,8 @@ impl SerializableItem for TerminalView {
                 .await?;
             db.save_agent_restore_state(item_id, workspace_id, agent_restore_state)
                 .await?;
+            db.save_output_snapshot(item_id, workspace_id, output_snapshot)
+                .await?;
             Ok(())
         }))
     }
@@ -2383,7 +2447,7 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
-            let (cwd, custom_title, agent_restore_state) = cx
+            let (cwd, custom_title, agent_restore_state, output_snapshot) = cx
                 .update(|_window, cx| {
                     let db = TerminalDb::global(cx);
                     let from_db = db
@@ -2409,6 +2473,7 @@ impl SerializableItem for TerminalView {
                         .get_agent_restore_state(item_id, workspace_id)
                         .log_err()
                         .flatten()
+                        .filter(|state| !state.trim().is_empty())
                         .and_then(|state| {
                             serde_json::from_str::<TerminalAgentRestoreState>(&state).log_err()
                         });
@@ -2425,10 +2490,14 @@ impl SerializableItem for TerminalView {
                             false
                         }
                     });
-                    (cwd, custom_title, agent_restore_state)
+                    let output_snapshot = db
+                        .get_output_snapshot(item_id, workspace_id)
+                        .log_err()
+                        .flatten();
+                    (cwd, custom_title, agent_restore_state, output_snapshot)
                 })
                 .ok()
-                .unwrap_or((None, None, None));
+                .unwrap_or((None, None, None, None));
 
             let terminal = project
                 .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
@@ -2446,6 +2515,7 @@ impl SerializableItem for TerminalView {
                     if custom_title.is_some() {
                         view.custom_title = custom_title;
                     }
+                    view.restore_output_snapshot(output_snapshot, cx);
                     if let Some(agent_restore_state) = agent_restore_state {
                         view.restore_agent_session(agent_restore_state, cx);
                     }

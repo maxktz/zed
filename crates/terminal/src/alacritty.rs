@@ -36,9 +36,9 @@ use vte::ansi::Handler;
 use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
 use crate::{
-    Cell, Color, Content, Cursor, CursorShape, Hyperlink, HyperlinkData, IndexedCell, Modes, Point,
-    PtyEvent, Range, RenderableCells, Scroll, Search, Selection, SelectionRange, SelectionSide,
-    SelectionType, TerminalBackendEvent, TerminalBounds, ViMotion,
+    Cell, Color, Content, Cursor, CursorShape, Hyperlink, HyperlinkData, IndexedCell, Modes,
+    NamedColor, Point, PtyEvent, Range, RenderableCells, Scroll, Search, Selection, SelectionRange,
+    SelectionSide, SelectionType, TerminalBackendEvent, TerminalBounds, ViMotion,
     pty_info::ProcessIdGetter,
     terminal_settings::{AlternateScroll, CursorShape as SettingsCursorShape},
 };
@@ -838,6 +838,47 @@ pub(super) fn content_text(term: &Term<ZedListener>) -> String {
     term.bounds_to_string(start, end)
 }
 
+pub(super) fn output_snapshot(
+    term: &Term<ZedListener>,
+    max_lines: usize,
+    max_bytes: usize,
+    min_lines: usize,
+    restored_marker: &str,
+) -> Vec<u8> {
+    if max_lines == 0 || max_bytes == 0 {
+        return Vec::new();
+    }
+
+    let grid = term.grid();
+    let topmost_line = grid.topmost_line().0;
+    let Some(bottommost_line) = find_last_non_empty_row(grid) else {
+        return Vec::new();
+    };
+
+    let mut lines = Vec::with_capacity(max_lines);
+    let mut current_line = bottommost_line;
+    while lines.len() < max_lines {
+        let row = &grid[Line(current_line)];
+        if !row_is_restored_output_marker(row, restored_marker) {
+            lines.push(ansi_snapshot_line(row));
+        }
+
+        if current_line == topmost_line {
+            break;
+        }
+        current_line -= 1;
+    }
+    if lines.len() < min_lines {
+        return Vec::new();
+    }
+
+    let mut snapshot = BoundedSnapshot::new(max_bytes);
+    for line in lines.into_iter().rev() {
+        snapshot.push_line(line);
+    }
+    snapshot.into_bytes()
+}
+
 pub(super) fn total_lines(term: &Term<ZedListener>) -> usize {
     term.total_lines()
 }
@@ -951,6 +992,270 @@ fn process_line(line: String) -> Option<String> {
         Some(trimmed)
     } else {
         None
+    }
+}
+
+fn find_last_non_empty_row(grid: &Grid<AlacCell>) -> Option<i32> {
+    let mut current_line = grid.bottommost_line().0;
+    let topmost_line = grid.topmost_line().0;
+    loop {
+        if !row_is_empty(&grid[Line(current_line)]) {
+            return Some(current_line);
+        }
+        if current_line == topmost_line {
+            return None;
+        }
+        current_line -= 1;
+    }
+}
+
+fn row_is_restored_output_marker(row: &Row<AlacCell>, marker: &str) -> bool {
+    if row_text(row).trim_end() != marker {
+        return false;
+    }
+
+    let mut cells = row[..Column(row.len())]
+        .iter()
+        .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER));
+    for _ in marker.chars() {
+        let Some(cell) = cells.next() else {
+            return false;
+        };
+        if !cell.flags.contains(Flags::DIM) {
+            return false;
+        }
+    }
+    true
+}
+
+fn row_is_empty(row: &Row<AlacCell>) -> bool {
+    row[..Column(row.len())].iter().all(is_empty_cell)
+}
+
+fn is_empty_cell(cell: &AlacCell) -> bool {
+    cell.c == ' '
+        && cell.zerowidth().is_none()
+        && cell.fg == Color::Named(NamedColor::Foreground)
+        && cell.bg == Color::Named(NamedColor::Background)
+        && !cell.flags.intersects(
+            Flags::BOLD
+                | Flags::DIM
+                | Flags::ITALIC
+                | Flags::ALL_UNDERLINES
+                | Flags::INVERSE
+                | Flags::STRIKEOUT,
+        )
+}
+
+fn row_text(row: &Row<AlacCell>) -> String {
+    let mut text = String::new();
+    for cell in &row[..Column(row.len())] {
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        text.push(cell.c);
+        if let Some(zerowidth) = cell.zerowidth() {
+            text.extend(zerowidth);
+        }
+    }
+    text
+}
+
+fn ansi_snapshot_line(row: &Row<AlacCell>) -> Vec<u8> {
+    let end_column = row[..Column(row.len())]
+        .iter()
+        .rposition(|cell| !is_empty_cell(cell))
+        .map_or(0, |index| index + 1);
+
+    let mut line = Vec::new();
+    let mut current_style = SnapshotStyle::default();
+    for cell in &row[..Column(end_column)] {
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        let style = SnapshotStyle::from_cell(cell);
+        if style != current_style {
+            style.push_sgr(&mut line);
+            current_style = style;
+        }
+        push_char(&mut line, cell.c);
+        if let Some(zerowidth) = cell.zerowidth() {
+            for character in zerowidth {
+                push_char(&mut line, *character);
+            }
+        }
+    }
+
+    if current_style != SnapshotStyle::default() {
+        line.extend_from_slice(b"\x1b[0m");
+    }
+    line.extend_from_slice(b"\r\n");
+    line
+}
+
+fn push_char(output: &mut Vec<u8>, character: char) {
+    let mut buffer = [0; 4];
+    output.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SnapshotStyle {
+    fg: Option<Color>,
+    bg: Option<Color>,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    strikeout: bool,
+    inverse: bool,
+}
+
+impl SnapshotStyle {
+    fn from_cell(cell: &AlacCell) -> Self {
+        Self {
+            fg: (!is_default_foreground(cell.fg)).then_some(cell.fg),
+            bg: (!is_default_background(cell.bg)).then_some(cell.bg),
+            bold: cell.flags.contains(Flags::BOLD),
+            dim: cell.flags.contains(Flags::DIM),
+            italic: cell.flags.contains(Flags::ITALIC),
+            underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
+            strikeout: cell.flags.contains(Flags::STRIKEOUT),
+            inverse: cell.flags.contains(Flags::INVERSE),
+        }
+    }
+
+    fn push_sgr(self, output: &mut Vec<u8>) {
+        output.extend_from_slice(b"\x1b[0");
+        if self.bold {
+            output.extend_from_slice(b";1");
+        }
+        if self.dim {
+            output.extend_from_slice(b";2");
+        }
+        if self.italic {
+            output.extend_from_slice(b";3");
+        }
+        if self.underline {
+            output.extend_from_slice(b";4");
+        }
+        if self.inverse {
+            output.extend_from_slice(b";7");
+        }
+        if self.strikeout {
+            output.extend_from_slice(b";9");
+        }
+        if let Some(fg) = self.fg {
+            push_color_sgr(output, fg, true);
+        }
+        if let Some(bg) = self.bg {
+            push_color_sgr(output, bg, false);
+        }
+        output.push(b'm');
+    }
+}
+
+fn is_default_foreground(color: Color) -> bool {
+    matches!(color, Color::Named(NamedColor::Foreground))
+}
+
+fn is_default_background(color: Color) -> bool {
+    matches!(color, Color::Named(NamedColor::Background))
+}
+
+fn push_color_sgr(output: &mut Vec<u8>, color: Color, foreground: bool) {
+    match color {
+        Color::Named(named) => {
+            let code = named_color_sgr(named, foreground);
+            output.extend_from_slice(format!(";{code}").as_bytes());
+        }
+        Color::Spec(rgb) => {
+            let prefix = if foreground { 38 } else { 48 };
+            output
+                .extend_from_slice(format!(";{prefix};2;{};{};{}", rgb.r, rgb.g, rgb.b).as_bytes());
+        }
+        Color::Indexed(index) => {
+            let prefix = if foreground { 38 } else { 48 };
+            output.extend_from_slice(format!(";{prefix};5;{index}").as_bytes());
+        }
+    }
+}
+
+fn named_color_sgr(color: NamedColor, foreground: bool) -> u16 {
+    match (color, foreground) {
+        (NamedColor::Black | NamedColor::DimBlack, true) => 30,
+        (NamedColor::Red | NamedColor::DimRed, true) => 31,
+        (NamedColor::Green | NamedColor::DimGreen, true) => 32,
+        (NamedColor::Yellow | NamedColor::DimYellow, true) => 33,
+        (NamedColor::Blue | NamedColor::DimBlue, true) => 34,
+        (NamedColor::Magenta | NamedColor::DimMagenta, true) => 35,
+        (NamedColor::Cyan | NamedColor::DimCyan, true) => 36,
+        (NamedColor::White | NamedColor::DimWhite, true) => 37,
+        (NamedColor::BrightBlack, true) => 90,
+        (NamedColor::BrightRed, true) => 91,
+        (NamedColor::BrightGreen, true) => 92,
+        (NamedColor::BrightYellow, true) => 93,
+        (NamedColor::BrightBlue, true) => 94,
+        (NamedColor::BrightMagenta, true) => 95,
+        (NamedColor::BrightCyan, true) => 96,
+        (NamedColor::BrightWhite, true) => 97,
+        (NamedColor::Black | NamedColor::DimBlack, false) => 40,
+        (NamedColor::Red | NamedColor::DimRed, false) => 41,
+        (NamedColor::Green | NamedColor::DimGreen, false) => 42,
+        (NamedColor::Yellow | NamedColor::DimYellow, false) => 43,
+        (NamedColor::Blue | NamedColor::DimBlue, false) => 44,
+        (NamedColor::Magenta | NamedColor::DimMagenta, false) => 45,
+        (NamedColor::Cyan | NamedColor::DimCyan, false) => 46,
+        (NamedColor::White | NamedColor::DimWhite, false) => 47,
+        (NamedColor::BrightBlack, false) => 100,
+        (NamedColor::BrightRed, false) => 101,
+        (NamedColor::BrightGreen, false) => 102,
+        (NamedColor::BrightYellow, false) => 103,
+        (NamedColor::BrightBlue, false) => 104,
+        (NamedColor::BrightMagenta, false) => 105,
+        (NamedColor::BrightCyan, false) => 106,
+        (NamedColor::BrightWhite, false) => 107,
+        (_, true) => 39,
+        (_, false) => 49,
+    }
+}
+
+struct BoundedSnapshot {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+}
+
+impl BoundedSnapshot {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_bytes,
+        }
+    }
+
+    fn push_line(&mut self, line: Vec<u8>) {
+        if line.len() >= self.max_bytes {
+            self.bytes.clear();
+            self.bytes
+                .extend_from_slice(&line[line.len().saturating_sub(self.max_bytes)..]);
+            return;
+        }
+
+        while self.bytes.len() + line.len() > self.max_bytes {
+            match self.bytes.iter().position(|byte| *byte == b'\n') {
+                Some(index) => {
+                    self.bytes.drain(..=index);
+                }
+                None => {
+                    self.bytes.clear();
+                    break;
+                }
+            }
+        }
+        self.bytes.extend_from_slice(&line);
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 }
 

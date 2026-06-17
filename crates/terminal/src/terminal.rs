@@ -65,11 +65,11 @@ use crate::alacritty::{
     AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PtySender, RegexSearches,
     append_text_to_term, apply_config, clear_saved_screen, content_text, display_offset,
     display_only_term_config, find_from_terminal_point, full_content_range, last_non_empty_lines,
-    make_content, new_term, open_pty, pty_options, pty_term_config, resize, screen_lines,
-    scroll_display, scroll_to_point, search_matches, selection_text, set_default_cursor_style,
-    set_selection as set_term_selection, spawn_event_loop, toggle_vi_mode as toggle_term_vi_mode,
-    total_lines, update_selection as update_term_selection, update_selection_to_vi_cursor,
-    update_vi_cursor_for_scroll, vi_goto_point, vi_motion,
+    make_content, new_term, open_pty, output_snapshot, pty_options, pty_term_config, resize,
+    screen_lines, scroll_display, scroll_to_point, search_matches, selection_text,
+    set_default_cursor_style, set_selection as set_term_selection, spawn_event_loop,
+    toggle_vi_mode as toggle_term_vi_mode, total_lines, update_selection as update_term_selection,
+    update_selection_to_vi_cursor, update_vi_cursor_for_scroll, vi_goto_point, vi_motion,
 };
 use crate::mappings::colors::to_vte_rgb;
 use crate::mappings::keys::to_esc_str;
@@ -853,6 +853,11 @@ const DEFAULT_SCROLL_HISTORY_LINES: usize = 10_000;
 pub const MAX_SCROLL_HISTORY_LINES: usize = 100_000;
 const ZED_AGENT_SESSION_STATE_FILE_ENV: &str = "ZED_AGENT_SESSION_STATE_FILE";
 static NEXT_AGENT_SESSION_STATE_FILE_ID: AtomicU64 = AtomicU64::new(0);
+const OUTPUT_SNAPSHOT_MAX_LINES: usize = 100;
+const OUTPUT_SNAPSHOT_MAX_BYTES: usize = 256 * 1024;
+const OUTPUT_SNAPSHOT_MIN_LINES: usize = 4;
+const OUTPUT_RESTORED_MARKER_TEXT: &str = "[output restored]";
+pub const OUTPUT_RESTORED_MARKER_BYTES: &[u8] = b"\x1b[2m[output restored]\x1b[0m\r\n";
 
 pub struct TerminalBuilder {
     terminal: Terminal,
@@ -2055,6 +2060,17 @@ impl Terminal {
     pub fn get_content(&self) -> String {
         let term = self.term.lock_unfair();
         content_text(&term)
+    }
+
+    pub fn output_snapshot(&self) -> Vec<u8> {
+        let term = self.term.lock_unfair();
+        output_snapshot(
+            &term,
+            OUTPUT_SNAPSHOT_MAX_LINES,
+            OUTPUT_SNAPSHOT_MAX_BYTES,
+            OUTPUT_SNAPSHOT_MIN_LINES,
+            OUTPUT_RESTORED_MARKER_TEXT,
+        )
     }
 
     pub fn last_n_non_empty_lines(&self, n: usize) -> Vec<String> {
