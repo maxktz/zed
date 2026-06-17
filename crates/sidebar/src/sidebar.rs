@@ -727,19 +727,9 @@ fn branch_label_for_path_list(
 
 fn strip_project_name_prefix(folder_name: String, project_group_key: &ProjectGroupKey) -> String {
     for project_path in project_group_key.path_list().ordered_paths() {
-        let Some(project_name) = project_path.file_name() else {
-            continue;
-        };
-        let project_name = project_name.to_string_lossy();
-        if project_name.is_empty() {
-            continue;
-        }
-
-        let prefix = format!("{project_name}.");
-        if let Some(stripped) = folder_name.strip_prefix(&prefix)
-            && !stripped.is_empty()
-        {
-            return stripped.to_string();
+        let normalized = project::normalize_worktree_name(&folder_name, project_path);
+        if normalized != folder_name {
+            return normalized;
         }
     }
 

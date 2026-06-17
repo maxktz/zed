@@ -8958,7 +8958,24 @@ pub fn linked_worktree_short_name(
             .to_str()?
             .to_string()
     };
-    Some(name.into())
+    Some(normalize_worktree_name(&name, main_worktree_path).into())
+}
+
+pub fn normalize_worktree_name(worktree_name: &str, main_worktree_path: &Path) -> String {
+    let Some(project_name) = main_worktree_path.file_name() else {
+        return worktree_name.to_string();
+    };
+    let project_name = project_name.to_string_lossy();
+    if project_name.is_empty() {
+        return worktree_name.to_string();
+    }
+
+    let prefix = format!("{project_name}.");
+    worktree_name
+        .strip_prefix(&prefix)
+        .filter(|stripped| !stripped.is_empty())
+        .unwrap_or(worktree_name)
+        .to_string()
 }
 
 fn get_permalink_in_rust_registry_src(

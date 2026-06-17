@@ -14,7 +14,7 @@ pub use platform_title_bar::{
     self, DraggedWindowTab, MergeAllWindows, MoveTabToNewWindow, PlatformTitleBar,
     ShowNextWindowTab, ShowPreviousWindowTab,
 };
-use project::{linked_worktree_short_name, repo_identity_path};
+use project::{linked_worktree_short_name, normalize_worktree_name, repo_identity_path};
 
 #[cfg(not(target_os = "macos"))]
 use crate::application_menu::{
@@ -68,12 +68,23 @@ fn title_bar_project_button_height() -> gpui::DefiniteLength {
     px(21.).into()
 }
 
-fn workspace_slot_title_label(path_list: &util::path_list::PathList) -> SharedString {
+fn workspace_slot_title_label(
+    path_list: &util::path_list::PathList,
+    project_group_key: &workspace::ProjectGroupKey,
+) -> SharedString {
     let names = path_list
         .ordered_paths()
         .filter_map(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().to_string())
+            path.file_name().map(|name| {
+                let name = name.to_string_lossy().to_string();
+                for project_path in project_group_key.path_list().ordered_paths() {
+                    let normalized = normalize_worktree_name(&name, project_path);
+                    if normalized != name {
+                        return normalized;
+                    }
+                }
+                name
+            })
         })
         .collect::<Vec<_>>();
 
@@ -992,7 +1003,12 @@ impl TitleBar {
                         .opening_workspace_slots()
                         .into_iter()
                         .next()
-                        .map(|slot_id| workspace_slot_title_label(slot_id.path_list()))
+                        .map(|slot_id| {
+                            workspace_slot_title_label(
+                                slot_id.path_list(),
+                                slot_id.project_group_key(),
+                            )
+                        })
                 })
         } else {
             None

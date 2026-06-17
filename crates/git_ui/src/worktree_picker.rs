@@ -11,8 +11,8 @@ use gpui::{
     Render, SharedString, Styled, Subscription, Task, TaskExt, WeakEntity, Window, actions, rems,
 };
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
-use project::Project;
 use project::git_store::RepositoryEvent;
+use project::{Project, linked_worktree_short_name};
 use ui::{
     Button, CommonAnimationExt as _, Divider, HighlightedLabel, IconButton, KeyBinding, ListItem,
     ListItemSpacing, ListSubHeader, Tooltip, prelude::*,
@@ -305,6 +305,19 @@ impl RemoteBranchName {
     }
 }
 
+fn worktree_directory_name(worktree: &GitWorktree, main_worktree_path: Option<&Path>) -> String {
+    if worktree.is_main {
+        return "main worktree".to_string();
+    }
+
+    main_worktree_path
+        .and_then(|main_worktree_path| {
+            linked_worktree_short_name(main_worktree_path, &worktree.path)
+        })
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| worktree.directory_name(main_worktree_path))
+}
+
 struct WorktreePickerDelegate {
     matches: Vec<WorktreeEntry>,
     all_worktrees: Vec<GitWorktree>,
@@ -523,7 +536,8 @@ impl WorktreePickerDelegate {
             return;
         };
         let path = worktree.path.clone();
-        let display_name = worktree.directory_name(
+        let display_name = worktree_directory_name(
+            worktree,
             self.all_worktrees
                 .iter()
                 .find(|worktree| worktree.is_main)
@@ -810,7 +824,7 @@ impl PickerDelegate for WorktreePickerDelegate {
             .find(|wt| wt.is_main)
             .map(|wt| wt.path.clone());
         let has_named_worktree = self.all_worktrees.iter().any(|worktree| {
-            worktree.directory_name(main_worktree_path.as_deref()) == normalized_query
+            worktree_directory_name(worktree, main_worktree_path.as_deref()) == normalized_query
         });
         let create_named_disabled_reason: Option<String> = if self.has_multiple_repositories {
             Some("Cannot create a named worktree in a project with multiple repositories".into())
@@ -836,8 +850,8 @@ impl PickerDelegate for WorktreePickerDelegate {
                 let project_paths = &self.project_worktree_paths;
 
                 let sort_by_name = |a: &GitWorktree, b: &GitWorktree| {
-                    a.directory_name(main_worktree_path.as_deref())
-                        .cmp(&b.directory_name(main_worktree_path.as_deref()))
+                    worktree_directory_name(a, main_worktree_path.as_deref())
+                        .cmp(&worktree_directory_name(b, main_worktree_path.as_deref()))
                 };
 
                 let (mut open_here, mut others): (Vec<_>, Vec<_>) = repo_worktrees
@@ -892,7 +906,7 @@ impl PickerDelegate for WorktreePickerDelegate {
             .map(|(ix, worktree)| {
                 StringMatchCandidate::new(
                     ix,
-                    &worktree.directory_name(main_worktree_path.as_deref()),
+                    &worktree_directory_name(worktree, main_worktree_path.as_deref()),
                 )
             })
             .collect();
@@ -1030,7 +1044,10 @@ impl PickerDelegate for WorktreePickerDelegate {
                                     workspace,
                                     &SwitchWorktree {
                                         path: worktree.path.clone(),
-                                        display_name: worktree.directory_name(main_worktree_path),
+                                        display_name: worktree_directory_name(
+                                            &worktree,
+                                            main_worktree_path,
+                                        ),
                                     },
                                     window,
                                     self.focused_dock,
@@ -1144,7 +1161,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                     .iter()
                     .find(|wt| wt.is_main)
                     .map(|wt| wt.path.as_path());
-                let display_name = worktree.directory_name(main_worktree_path);
+                let display_name = worktree_directory_name(worktree, main_worktree_path);
                 let first_line = display_name.lines().next().unwrap_or(&display_name);
                 let positions: Vec<_> = positions
                     .iter()
