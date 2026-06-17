@@ -2720,10 +2720,16 @@ impl Sidebar {
         let is_group_header_after_first =
             ix > 0 && matches!(entry, ListEntry::ProjectHeader { .. });
 
-        let is_active = self
-            .active_entry
+        let active_workspace = self.active_workspace(cx);
+        let active_project_group_key = active_workspace
             .as_ref()
-            .is_some_and(|active| active.matches_entry(entry));
+            .map(|workspace| workspace.read(cx).project_group_key(cx));
+        let is_active = self.active_entry.as_ref().is_some_and(|active| {
+            active.matches_entry(entry)
+                && active_workspace
+                    .as_ref()
+                    .is_some_and(|workspace| active.workspace() == workspace)
+        });
 
         let rendered = match entry {
             ListEntry::ProjectHeader {
@@ -2733,7 +2739,7 @@ impl Sidebar {
                 has_running_threads,
                 waiting_thread_count,
                 has_notifications,
-                is_active: is_active_group,
+                is_active: _,
                 has_threads,
             } => {
                 self.project_header_menu_handles.entry(ix).or_default();
@@ -2750,7 +2756,9 @@ impl Sidebar {
                     *has_running_threads,
                     *waiting_thread_count,
                     *has_notifications,
-                    *is_active_group,
+                    active_project_group_key
+                        .as_ref()
+                        .is_some_and(|active_key| active_key == key),
                     is_selected,
                     *has_threads,
                     // has_active_draft,
@@ -2764,7 +2772,7 @@ impl Sidebar {
                 label_source,
                 highlight_positions,
                 workspace,
-                is_active,
+                is_active: _,
                 is_loading,
                 has_open_chats,
             } => self
@@ -2776,7 +2784,9 @@ impl Sidebar {
                     *label_source,
                     highlight_positions,
                     workspace.as_ref(),
-                    *is_active,
+                    workspace
+                        .as_ref()
+                        .is_some_and(|workspace| active_workspace.as_ref() == Some(workspace)),
                     *is_loading,
                     *has_open_chats,
                     is_selected,
