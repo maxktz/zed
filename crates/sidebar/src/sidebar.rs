@@ -7626,7 +7626,7 @@ impl Sidebar {
             })
     }
 
-    fn render_search(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_search(&self, _window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_query = self.has_filter_query(cx);
 
         h_flex()
@@ -7647,10 +7647,6 @@ impl Sidebar {
                 ),
             )
             .child(self.render_filter_input(cx))
-            .when(
-                self.selection.is_some() && !self.filter_editor.focus_handle(cx).is_focused(window),
-                |this| this.child(KeyBinding::for_action(&FocusThreadsSearch, cx)),
-            )
             .when(has_query, |this| {
                 this.child(
                     IconButton::new("clear_filter", IconName::Close)
