@@ -1,7 +1,7 @@
 use crate::focus_follows_mouse::FocusFollowsMouse as _;
 use crate::persistence::model::DockData;
 use crate::status_bar::HideStatusItem;
-use crate::{DraggedDock, Event, FocusFollowsMouse, ModalLayer, Pane, WorkspaceSettings};
+use crate::{DraggedDock, Event, FocusFollowsMouse, ModalLayer, Pane, WorkspaceSettings, ZoomMode};
 use crate::{Workspace, status_bar::StatusItemView};
 use anyhow::Context as _;
 use client::proto;
@@ -25,7 +25,7 @@ use util::ResultExt as _;
 pub(crate) const RESIZE_HANDLE_SIZE: Pixels = px(6.);
 
 pub enum PanelEvent {
-    ZoomIn,
+    ZoomIn { mode: ZoomMode },
     ZoomOut,
     Activate,
     Close,
@@ -436,10 +436,14 @@ impl Dock {
                 };
                 if panel.is_zoomed(window, cx) {
                     workspace.zoomed = Some(panel.to_any().downgrade());
+                    if workspace.zoomed_position != Some(position) {
+                        workspace.zoomed_mode = ZoomMode::Full;
+                    }
                     workspace.zoomed_position = Some(position);
                 } else {
                     workspace.zoomed = None;
                     workspace.zoomed_position = None;
+                    workspace.zoomed_mode = ZoomMode::Full;
                 }
                 cx.emit(Event::ZoomChanged);
                 workspace.dismiss_zoomed_items_to_reveal(Some(position), window, cx);
@@ -454,6 +458,9 @@ impl Dock {
                 && panel.is_zoomed(window, cx)
             {
                 workspace.zoomed = Some(panel.to_any().downgrade());
+                if workspace.zoomed_position != Some(position) {
+                    workspace.zoomed_mode = ZoomMode::Full;
+                }
                 workspace.zoomed_position = Some(position);
                 cx.emit(Event::ZoomChanged);
                 return;
@@ -461,6 +468,7 @@ impl Dock {
             if workspace.zoomed_position == Some(position) {
                 workspace.zoomed = None;
                 workspace.zoomed_position = None;
+                workspace.zoomed_mode = ZoomMode::Full;
                 cx.emit(Event::ZoomChanged);
             }
         })
@@ -599,6 +607,7 @@ impl Dock {
                     let Ok(new_dock) = workspace.update(cx, |workspace, cx| {
                         if panel.is_zoomed(window, cx) {
                             workspace.zoomed_position = Some(new_position);
+                            workspace.zoomed_mode = ZoomMode::Full;
                         }
                         match new_position {
                             DockPosition::Left => &workspace.left_dock,
@@ -658,7 +667,7 @@ impl Dock {
                 &panel,
                 window,
                 move |this, panel, event, window, cx| match event {
-                    PanelEvent::ZoomIn => {
+                    PanelEvent::ZoomIn { mode } => {
                         this.set_panel_zoomed(&panel.to_any(), true, window, cx);
                         if !PanelHandle::panel_focus_handle(panel, cx).contains_focused(window, cx)
                         {
@@ -669,6 +678,7 @@ impl Dock {
                                 workspace.zoomed = Some(panel.downgrade().into());
                                 workspace.zoomed_position =
                                     Some(panel.read(cx).position(window, cx));
+                                workspace.zoomed_mode = *mode;
                                 cx.emit(Event::ZoomChanged);
                             })
                             .ok();
@@ -680,6 +690,7 @@ impl Dock {
                                 if workspace.zoomed_position == Some(this.position) {
                                     workspace.zoomed = None;
                                     workspace.zoomed_position = None;
+                                    workspace.zoomed_mode = ZoomMode::Full;
                                     cx.emit(Event::ZoomChanged);
                                 }
                                 cx.notify();

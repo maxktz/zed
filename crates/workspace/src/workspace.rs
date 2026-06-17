@@ -328,6 +328,8 @@ actions!(
         ToggleLeftDock,
         /// Toggles the right dock.
         ToggleRightDock,
+        /// Toggles half zoom on the active pane, preserving side docks.
+        ToggleHalfZoom,
         /// Toggles zoom on the active pane.
         ToggleZoom,
         /// Toggles read-only mode for the active item (if supported by that item).
@@ -1361,6 +1363,7 @@ pub struct Workspace {
     zoomed: Option<AnyWeakView>,
     previous_dock_drag_coordinates: Option<Point<Pixels>>,
     zoomed_position: Option<DockPosition>,
+    zoomed_mode: ZoomMode,
     center: PaneGroup,
     left_dock: Entity<Dock>,
     bottom_dock: Entity<Dock>,
@@ -1810,6 +1813,7 @@ impl Workspace {
             weak_self: weak_handle.clone(),
             zoomed: None,
             zoomed_position: None,
+            zoomed_mode: ZoomMode::Full,
             previous_dock_drag_coordinates: None,
             center,
             panes: vec![center_pane.clone()],
@@ -2456,6 +2460,20 @@ impl Workspace {
                 .size
                 .unwrap_or_else(|| panel.default_size(window, cx)),
         )
+    }
+
+    fn side_dock_zoom_inset(&self, position: DockPosition, window: &Window, cx: &App) -> Pixels {
+        let dock = match position {
+            DockPosition::Left => &self.left_dock,
+            DockPosition::Right => &self.right_dock,
+            DockPosition::Bottom => return Pixels::ZERO,
+        };
+        let dock = dock.read(cx);
+        if !dock.is_open() {
+            return Pixels::ZERO;
+        }
+
+        self.dock_size(&dock, window, cx).unwrap_or(Pixels::ZERO)
     }
 
     pub fn dock_flex_for_size(
@@ -4485,6 +4503,7 @@ impl Workspace {
         if self.zoomed_position != dock_to_reveal {
             self.zoomed = None;
             self.zoomed_position = None;
+            self.zoomed_mode = ZoomMode::Full;
             cx.emit(Event::ZoomChanged);
         }
 
@@ -5531,6 +5550,7 @@ impl Workspace {
             self.zoomed = Some(pane.downgrade().into());
         } else {
             self.zoomed = None;
+            self.zoomed_mode = ZoomMode::Full;
         }
         self.zoomed_position = None;
         cx.emit(Event::ZoomChanged);
@@ -5662,12 +5682,13 @@ impl Workspace {
                 window.invalidate_character_coordinates();
                 self.handle_pane_focused(pane.clone(), window, cx);
             }
-            pane::Event::ZoomIn => {
+            pane::Event::ZoomIn { mode } => {
                 if *pane == self.active_pane {
                     pane.update(cx, |pane, cx| pane.set_zoomed(true, cx));
                     if pane.read(cx).has_focus(window, cx) {
                         self.zoomed = Some(pane.downgrade().into());
                         self.zoomed_position = None;
+                        self.zoomed_mode = *mode;
                         cx.emit(Event::ZoomChanged);
                     }
                     cx.notify();
@@ -5677,6 +5698,7 @@ impl Workspace {
                 pane.update(cx, |pane, cx| pane.set_zoomed(false, cx));
                 if self.zoomed_position.is_none() {
                     self.zoomed = None;
+                    self.zoomed_mode = ZoomMode::Full;
                     cx.emit(Event::ZoomChanged);
                 }
                 cx.notify();
@@ -9019,10 +9041,29 @@ impl Render for Workspace {
                                     .border_color(colors.border)
                                     .bg(colors.background)
                                     .child(zoomed_view)
-                                    .inset_0()
                                     .shadow_lg();
 
-                                if !WorkspaceSettings::get_global(cx).zoomed_padding {
+                                let has_padding = WorkspaceSettings::get_global(cx).zoomed_padding;
+                                if self.zoomed_mode == ZoomMode::Half {
+                                    let padding = if has_padding { px(8.) } else { px(0.) };
+                                    let left = if self.zoomed_position == Some(DockPosition::Left) {
+                                        Pixels::ZERO
+                                    } else {
+                                        self.side_dock_zoom_inset(DockPosition::Left, window, cx)
+                                    } + padding;
+                                    let right = if self.zoomed_position == Some(DockPosition::Right)
+                                    {
+                                        Pixels::ZERO
+                                    } else {
+                                        self.side_dock_zoom_inset(DockPosition::Right, window, cx)
+                                    } + padding;
+                                    let div =
+                                        div.top(padding).bottom(padding).left(left).right(right);
+                                    return Some(if has_padding { div.border_1() } else { div });
+                                }
+
+                                let div = div.inset_0();
+                                if !has_padding {
                                     return Some(div);
                                 }
 
@@ -14249,7 +14290,11 @@ mod tests {
         });
 
         // Emitting a ZoomIn event shows the panel as zoomed.
-        panel_1.update(cx, |_, cx| cx.emit(PanelEvent::ZoomIn));
+        panel_1.update(cx, |_, cx| {
+            cx.emit(PanelEvent::ZoomIn {
+                mode: ZoomMode::Full,
+            })
+        });
         workspace.read_with(cx, |workspace, _| {
             assert_eq!(workspace.zoomed, Some(panel_1.to_any().downgrade()));
             assert_eq!(workspace.zoomed_position, Some(DockPosition::Left));

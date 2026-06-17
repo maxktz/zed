@@ -1,7 +1,7 @@
 use crate::{
     CloseWindow, NewCenterTerminal, NewFile, NewTerminal, OpenInTerminal, OpenOptions,
-    OpenTerminal, OpenVisible, SplitDirection, ToggleFileFinder, ToggleProjectSymbols, ToggleZoom,
-    Workspace, WorkspaceItemBuilder, ZoomIn, ZoomOut,
+    OpenTerminal, OpenVisible, SplitDirection, ToggleFileFinder, ToggleHalfZoom,
+    ToggleProjectSymbols, ToggleZoom, Workspace, WorkspaceItemBuilder, ZoomIn, ZoomOut,
     focus_follows_mouse::FocusFollowsMouse as _,
     invalid_item_view::InvalidItemView,
     item::{
@@ -344,12 +344,21 @@ pub enum Event {
     JoinIntoNext,
     ChangeItemTitle,
     Focus,
-    ZoomIn,
+    ZoomIn {
+        mode: ZoomMode,
+    },
     ZoomOut,
     UserSavedItem {
         item: Box<dyn WeakItemHandle>,
         save_intent: SaveIntent,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ZoomMode {
+    #[default]
+    Full,
+    Half,
 }
 
 impl fmt::Debug for Event {
@@ -377,7 +386,7 @@ impl fmt::Debug for Event {
             Event::JoinIntoNext => f.write_str("JoinIntoNext"),
             Event::ChangeItemTitle => f.write_str("ChangeItemTitle"),
             Event::Focus => f.write_str("Focus"),
-            Event::ZoomIn => f.write_str("ZoomIn"),
+            Event::ZoomIn { mode } => f.debug_tuple("ZoomIn").field(mode).finish(),
             Event::ZoomOut => f.write_str("ZoomOut"),
             Event::UserSavedItem { item, save_intent } => f
                 .debug_struct("UserSavedItem")
@@ -1447,7 +1456,29 @@ impl Pane {
             if !self.focus_handle.contains_focused(window, cx) {
                 cx.focus_self(window);
             }
-            cx.emit(Event::ZoomIn);
+            cx.emit(Event::ZoomIn {
+                mode: ZoomMode::Full,
+            });
+        }
+    }
+
+    pub fn toggle_half_zoom(
+        &mut self,
+        _: &ToggleHalfZoom,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_toggle_zoom {
+            cx.propagate();
+        } else if self.zoomed {
+            cx.emit(Event::ZoomOut);
+        } else if !self.items.is_empty() {
+            if !self.focus_handle.contains_focused(window, cx) {
+                cx.focus_self(window);
+            }
+            cx.emit(Event::ZoomIn {
+                mode: ZoomMode::Half,
+            });
         }
     }
 
@@ -1458,7 +1489,9 @@ impl Pane {
             if !self.focus_handle.contains_focused(window, cx) {
                 cx.focus_self(window);
             }
-            cx.emit(Event::ZoomIn);
+            cx.emit(Event::ZoomIn {
+                mode: ZoomMode::Full,
+            });
         }
     }
 
@@ -4383,6 +4416,7 @@ impl Render for Pane {
                 cx.emit(Event::JoinAll);
             }))
             .on_action(cx.listener(Pane::toggle_zoom))
+            .on_action(cx.listener(Pane::toggle_half_zoom))
             .on_action(cx.listener(Pane::zoom_in))
             .on_action(cx.listener(Pane::zoom_out))
             .on_action(cx.listener(Self::navigate_backward))

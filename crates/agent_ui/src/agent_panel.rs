@@ -100,7 +100,7 @@ use ui::{
 use util::ResultExt as _;
 use workspace::{
     CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PathList, SerializedPathList,
-    ToggleWorkspaceSidebar, ToggleZoom, Workspace, WorkspaceId,
+    ToggleHalfZoom, ToggleWorkspaceSidebar, ToggleZoom, Workspace, WorkspaceId, ZoomMode,
     dock::{DockPosition, Panel, PanelEvent},
     item::ItemEvent,
 };
@@ -3501,7 +3501,27 @@ impl AgentPanel {
             if !self.focus_handle(cx).contains_focused(window, cx) {
                 cx.focus_self(window);
             }
-            cx.emit(PanelEvent::ZoomIn);
+            cx.emit(PanelEvent::ZoomIn {
+                mode: ZoomMode::Full,
+            });
+        }
+    }
+
+    pub fn toggle_half_zoom(
+        &mut self,
+        _: &ToggleHalfZoom,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.zoomed {
+            cx.emit(PanelEvent::ZoomOut);
+        } else {
+            if !self.focus_handle(cx).contains_focused(window, cx) {
+                cx.focus_self(window);
+            }
+            cx.emit(PanelEvent::ZoomIn {
+                mode: ZoomMode::Half,
+            });
         }
     }
 
@@ -6445,6 +6465,7 @@ impl Render for AgentPanel {
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::toggle_zoom))
+            .on_action(cx.listener(Self::toggle_half_zoom))
             .on_action(cx.listener(|this, _: &ReauthenticateAgent, window, cx| {
                 if let Some(conversation_view) = this.active_conversation_view() {
                     conversation_view.update(cx, |conversation_view, cx| {

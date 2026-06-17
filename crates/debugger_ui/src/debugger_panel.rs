@@ -41,7 +41,7 @@ use util::{ResultExt, debug_panic, maybe};
 use workspace::SplitDirection;
 use workspace::item::SaveOptions;
 use workspace::{
-    Item, Pane, Workspace,
+    Item, Pane, Workspace, ZoomMode,
     dock::{DockPosition, Panel, PanelEvent},
 };
 use zed_actions::debug_panel::ToggleFocus;
@@ -1314,7 +1314,9 @@ impl DebugPanel {
             if !self.focus_handle(cx).contains_focused(window, cx) {
                 cx.focus_self(window);
             }
-            cx.emit(PanelEvent::ZoomIn);
+            cx.emit(PanelEvent::ZoomIn {
+                mode: ZoomMode::Full,
+            });
         }
     }
 

@@ -368,13 +368,13 @@ impl TerminalPanel {
                     focus_on_pane.focus_handle(cx).focus(window, cx);
                 }
             }
-            pane::Event::ZoomIn => {
+            pane::Event::ZoomIn { mode } => {
                 for pane in self.center.panes() {
                     pane.update(cx, |pane, cx| {
                         pane.set_zoomed(true, cx);
                     })
                 }
-                cx.emit(PanelEvent::ZoomIn);
+                cx.emit(PanelEvent::ZoomIn { mode: *mode });
                 cx.notify();
             }
             pane::Event::ZoomOut => {
