@@ -64,6 +64,10 @@ const MAX_PROJECT_NAME_LENGTH: usize = 40;
 const MAX_BRANCH_NAME_LENGTH: usize = 40;
 const MAX_SHORT_SHA_LENGTH: usize = 8;
 
+fn title_bar_project_button_height() -> gpui::DefiniteLength {
+    px(21.).into()
+}
+
 fn workspace_slot_title_label(path_list: &util::path_list::PathList) -> SharedString {
     let names = path_list
         .ordered_paths()
@@ -841,6 +845,12 @@ impl TitleBar {
             .trigger_with_tooltip(
                 Button::new("project_name_trigger", display_name)
                     .label_size(LabelSize::Small)
+                    .height(title_bar_project_button_height())
+                    .start_icon(
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
                     .when(self.worktree_count(cx) > 1, |this| {
                         this.end_icon(
                             Icon::new(IconName::ChevronDown)
@@ -892,6 +902,12 @@ impl TitleBar {
             .trigger_with_tooltip(
                 Button::new("project_name_trigger", display_name)
                     .label_size(LabelSize::Small)
+                    .height(title_bar_project_button_height())
+                    .start_icon(
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
                     .when(self.worktree_count(cx) > 1, |this| {
                         this.end_icon(
                             Icon::new(IconName::ChevronDown)
@@ -1011,6 +1027,7 @@ impl TitleBar {
                     Button::new("worktree_picker_trigger", display_label)
                         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                         .label_size(LabelSize::Small)
+                        .height(title_bar_project_button_height())
                         .color(Color::Muted)
                         .loading(is_creating)
                         .start_icon(
@@ -1043,6 +1060,7 @@ impl TitleBar {
                     Button::new("project_branch_trigger", "Create Branch")
                         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                         .label_size(LabelSize::Small)
+                        .height(title_bar_project_button_height())
                         .start_icon(
                             Icon::new(IconName::GitBranchPlus)
                                 .size(IconSize::XSmall)
@@ -1052,6 +1070,7 @@ impl TitleBar {
                     Button::new("project_branch_trigger", branch_name)
                         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                         .label_size(LabelSize::Small)
+                        .height(title_bar_project_button_height())
                         .color(Color::Muted)
                         .start_icon(
                             Icon::new(branch_icon)

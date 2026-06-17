@@ -195,6 +195,12 @@ impl Button {
         self.loading = loading;
         self
     }
+
+    /// Overrides the button height.
+    pub fn height(mut self, height: impl Into<DefiniteLength>) -> Self {
+        self.base = self.base.height(height.into());
+        self
+    }
 }
 
 impl Toggleable for Button {
